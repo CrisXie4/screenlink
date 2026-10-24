@@ -1,17 +1,22 @@
-// 轻量应用状态 + DOM 工具
+// 应用状态（唯一数据源；组件订阅 notify 重渲染）
 import type { DeviceInfo, Settings } from "./tauri";
+
+export type Phase = "idle" | "connecting" | "connected";
 
 export interface Store {
   devices: DeviceInfo[];
-  mirroringSerial: string | null;
+  /** 左侧列表中选中的设备（连接由此发起） */
+  selected: string | null;
+  conn: { phase: Phase; serial: string | null; step: string };
   settings: Settings;
-  wsPort: number;
   aiEnabled: boolean;
+  wsPort: number;
 }
 
 export const store: Store = {
   devices: [],
-  mirroringSerial: null,
+  selected: null,
+  conn: { phase: "idle", serial: null, step: "" },
   settings: {
     max_size: 1600,
     bit_rate: 12_000_000,
@@ -21,8 +26,8 @@ export const store: Store = {
     clipboard_sync: true,
     auto_switch_wifi: true,
   },
-  wsPort: 27193,
   aiEnabled: false,
+  wsPort: 27193,
 };
 
 type Listener = () => void;
@@ -35,11 +40,15 @@ export function notify() {
   listeners.forEach((fn) => fn());
 }
 
-/** 创建带 class/子元素/事件的元素 */
+export function selectedDevice(): DeviceInfo | null {
+  return store.devices.find((d) => d.serial === store.selected) ?? null;
+}
+
+/** 创建带 class/子元素/事件的元素（children 支持 Node/string/数组） */
 export function el<K extends keyof HTMLElementTagNameMap>(
   tag: K,
   attrs: Record<string, string | boolean | EventListenerOrEventListenerObject> = {},
-  ...children: (Node | string | null | undefined)[]
+  ...children: (Node | string | null | undefined | (Node | string)[])[]
 ): HTMLElementTagNameMap[K] {
   const node = document.createElement(tag);
   for (const [k, v] of Object.entries(attrs)) {
@@ -51,28 +60,42 @@ export function el<K extends keyof HTMLElementTagNameMap>(
       node.setAttribute(k, v as string);
     }
   }
-  for (const c of children) {
-    if (c == null) continue;
-    node.append(typeof c === "string" ? document.createTextNode(c) : c);
-  }
+  append(node, children);
   return node;
 }
 
-/** 右下角 toast */
+function append(node: HTMLElement, children: (Node | string | null | undefined | (Node | string)[])[]) {
+  for (const c of children) {
+    if (c == null) continue;
+    if (Array.isArray(c)) {
+      append(node, c);
+    } else {
+      node.append(typeof c === "string" ? document.createTextNode(c) : c);
+    }
+  }
+}
+
+/** 右上角 toast（错误统一走 toast，不弹窗） */
 export function toast(title: string, body = "", isError = false) {
   const box = document.querySelector(".toasts")!;
-  const t = el("div", { class: `toast${isError ? " error" : ""}` },
+  const t = el(
+    "div",
+    { class: `toast${isError ? " error" : ""}` },
     el("div", { class: "t-title" }, title),
-    body ? el("div", { class: "t-body" }, body) : null);
+    body ? el("div", { class: "t-body" }, body) : null,
+  );
   box.append(t);
-  setTimeout(() => t.remove(), isError ? 6000 : 3500);
+  setTimeout(() => t.remove(), isError ? 6000 : 3200);
 }
 
 export function fmtBytes(n: number): string {
   const u = ["B", "KB", "MB", "GB", "TB"];
   let v = n;
   let i = 0;
-  while (v >= 1024 && i < u.length - 1) { v /= 1024; i++; }
+  while (v >= 1024 && i < u.length - 1) {
+    v /= 1024;
+    i++;
+  }
   return `${v.toFixed(1)} ${u[i]}`;
 }
 

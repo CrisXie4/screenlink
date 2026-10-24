@@ -21,7 +21,7 @@
         "resizable": true,
         "dragDropEnabled": true,
         "decorations": true,
-        "theme": "Dark"
+        "theme": "Light"
       }
     ],
     "security": {

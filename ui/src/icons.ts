@@ -34,6 +34,23 @@ const PATHS: Record<string, string> = {
   send: '<path d="M12 17V3"/><path d="m6 9 6-6 6 6"/><path d="M19 21H5"/>',
   // 接收（下载箭头）
   receive: '<path d="M12 3v14"/><path d="m6 15 6 6 6-6"/><path d="M19 3H5"/>',
+  // 折叠箭头
+  chevronUp: '<path d="m18 15-6-6-6 6"/>',
+  chevronDown: '<path d="m6 9 6 6 6-6"/>',
+  // 左侧面板
+  panelLeft: '<rect x="3" y="3" width="18" height="18" rx="2"/><path d="M9 3v18"/>',
+  // 播放（连接）
+  play: '<polygon points="6 3 20 12 6 21 6 3" fill="currentColor" stroke="none"/>',
+  // 数据线（USB）
+  cable: '<path d="M12 22v-5"/><path d="M9 8V2"/><path d="M15 8V2"/><path d="M18 8v5a4 4 0 0 1-4 4h-4a4 4 0 0 1-4-4V8Z"/>',
+  // WiFi
+  wifi: '<path d="M5 13a10 10 0 0 1 14 0"/><path d="M8.5 16.5a5 5 0 0 1 7 0"/><path d="M2 8.82a15 15 0 0 1 20 0"/><circle cx="12" cy="20" r="1" fill="currentColor" stroke="none"/>',
+  // 刷新
+  refresh: '<path d="M3 12a9 9 0 0 1 15-6.7L21 8"/><path d="M21 3v5h-5"/><path d="M21 12a9 9 0 0 1-15 6.7L3 16"/><path d="M3 21v-5h5"/>',
+  // 加载圈
+  loader: '<path d="M21 12a9 9 0 1 1-6.2-8.56"/>',
+  // 手机
+  phone: '<rect x="7" y="2" width="10" height="20" rx="2"/><circle cx="12" cy="18" r="1"/>',
   // 镜像/投屏（显示器+手机）
   mirror:
     '<rect x="2" y="4" width="13" height="10" rx="2"/><path d="M9 18h4"/><path d="M6 18c0-2 2-4 4-4"/><rect x="16" y="9" width="6" height="11" rx="1.5"/>',
