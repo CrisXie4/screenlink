@@ -122,8 +122,26 @@ async fn run() -> anyhow::Result<()> {
                 session.info.height,
                 session.info.codec
             );
+            {
+                let info = session.avcc_info.lock().unwrap().clone();
+                use base64::Engine;
+                if let Some(i) = info {
+                    let raw = base64::engine::general_purpose::STANDARD
+                        .decode(&i.description_b64)
+                        .unwrap_or_default();
+                    println!(
+                        "avcC codec={} len={} hex={}",
+                        i.codec,
+                        raw.len(),
+                        raw.iter().map(|b| format!("{b:02x}")).collect::<String>()
+                    );
+                } else {
+                    println!("avcC: <none>");
+                }
+            }
             let mut rx = session.video_rx.resubscribe();
             let mut n = 0usize;
+            let mut key_dumped = false;
             let mut bytes = 0u64;
             let first_key = std::time::Instant::now();
             let mut first_key_ms = 0u128;
@@ -132,6 +150,11 @@ async fn run() -> anyhow::Result<()> {
                     Ok(chunk) => {
                         if chunk[0] == 1 && first_key_ms == 0 {
                             first_key_ms = first_key.elapsed().as_millis();
+                        }
+                        if chunk[0] == 1 && !key_dumped {
+                            key_dumped = true;
+                            let hex: String = chunk.iter().take(25).map(|b| format!("{b:02x}")).collect();
+                            println!("first key chunk (avcc) head: {} total={}", hex, chunk.len());
                         }
                         n += 1;
                         bytes += chunk.len() as u64;

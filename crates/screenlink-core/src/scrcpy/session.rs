@@ -20,6 +20,74 @@ pub struct VideoInfo {
     pub height: i32,
 }
 
+/// avcC 描述（mp4 风格）与 codec 串，供 WebCodecs configure
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AvcInfo {
+    pub codec: String,
+    #[serde(rename = "descriptionB64")]
+    pub description_b64: String,
+}
+
+/// 解析 Annex-B 为 NAL 列表（正确处理 3/4 字节起始码）
+fn split_annexb(payload: &[u8]) -> Vec<&[u8]> {
+    let mut starts: Vec<usize> = Vec::new();
+    let mut i = 0usize;
+    while i + 2 < payload.len() {
+        if payload[i] == 0 && payload[i + 1] == 0 && payload[i + 2] == 1 {
+            starts.push(i + 3);
+            i += 3;
+        } else {
+            i += 1;
+        }
+    }
+    let mut nals = Vec::with_capacity(starts.len());
+    for k in 0..starts.len() {
+        let s = starts[k];
+        // 终点 = 下一起始码引导零的起点（3/4 字节形式均适用）
+        let e = if k + 1 < starts.len() { starts[k + 1] - 3 } else { payload.len() };
+        if e > s {
+            nals.push(&payload[s..e]);
+        }
+    }
+    nals
+}
+
+/// config 包 -> avcC 盒 + codec 串
+pub fn build_avc_info(config_payload: &[u8]) -> Option<AvcInfo> {
+    use base64::Engine;
+    let nals = split_annexb(config_payload);
+    let sps = nals.iter().find(|n| (n[0] & 0x1f) == 7)?;
+    let pps = nals.iter().find(|n| (n[0] & 0x1f) == 8)?;
+    let mut out = Vec::with_capacity(11 + sps.len() + pps.len());
+    out.push(1);
+    out.push(sps[1]);
+    out.push(sps[2]);
+    out.push(sps[3]);
+    out.push(0xff); // lengthSizeMinusOne = 3
+    out.push(0xe1); // numOfSPS = 1
+    out.extend_from_slice(&(sps.len() as u16).to_be_bytes());
+    out.extend_from_slice(sps);
+    out.push(1); // numOfPPS
+    out.extend_from_slice(&(pps.len() as u16).to_be_bytes());
+    out.extend_from_slice(pps);
+    let codec = format!("avc1.{:02X}{:02X}{:02X}", sps[1], sps[2], sps[3]);
+    Some(AvcInfo {
+        codec,
+        description_b64: base64::engine::general_purpose::STANDARD.encode(&out),
+    })
+}
+
+/// Annex-B -> avcc（每 NAL 前加 4 字节大端长度）
+fn annexb_to_avcc(payload: &[u8]) -> Vec<u8> {
+    let nals = split_annexb(payload);
+    let mut out = Vec::with_capacity(payload.len() + 4 * nals.len());
+    for n in nals {
+        out.extend_from_slice(&(n.len() as u32).to_be_bytes());
+        out.extend_from_slice(n);
+    }
+    out
+}
+
 #[derive(Debug, Clone)]
 pub enum SessionStateInner {
     Starting,
@@ -42,6 +110,11 @@ pub struct SessionHandle {
     pub video_rx: broadcast::Receiver<Vec<u8>>,
     /// SPS/PPS config 包缓存（流启动时只发一次，后接入的渲染端需要补发）
     pub config_cache: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
+    /// avcC 描述 + codec 串（Rust 端从 config 包解析，经 WS info 下发）
+    pub avcc_info: Arc<std::sync::Mutex<Option<AvcInfo>>>,
+    /// 最后一个关键帧（avcc 格式块）：静态画面可能长时间无新帧，
+    /// 后接入的渲染端必须先拿到 key 才能解码 delta
+    pub last_key: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
     pub events_rx: broadcast::Receiver<DeviceEvent>,
     pub ctl: Arc<ControlConn>,
     pub state_rx: watch::Receiver<SessionStateInner>,
@@ -297,8 +370,16 @@ pub async fn start_session(
     let config_cache: Arc<std::sync::Mutex<Option<Vec<u8>>>> =
         Arc::new(std::sync::Mutex::new(None));
     let config_cache2 = config_cache.clone();
+    let avcc_info: Arc<std::sync::Mutex<Option<AvcInfo>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let avcc_info2 = avcc_info.clone();
+    let last_key: Arc<std::sync::Mutex<Option<Vec<u8>>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let last_key2 = last_key.clone();
     let video_pump: JoinHandle<()> = tokio::spawn(async move {
         let config_cache = config_cache2;
+        let avcc_info = avcc_info2;
+        let last_key = last_key2;
         let mut rd = video_rd;
         loop {
             let hdr = match crate::util::read_exact(&mut rd, 12).await {
@@ -318,13 +399,28 @@ pub async fn start_session(
             } else {
                 2
             };
-            let pts = if kind == 0 { 0 } else { pts_and_flags };
-            let mut chunk = Vec::with_capacity(CHUNK_HEADER_LEN + len);
+            // 剥离 CONFIG/KEYFRAME 标志位，得到纯 pts（µs）——否则 key 帧的
+            // timestamp 高达 4.6e18，前端 Number 后超出 WebCodecs long long 范围
+            let pts = if kind == 0 {
+                0
+            } else {
+                (pts_and_flags & !(protocol::PACKET_FLAG_CONFIG | protocol::PACKET_FLAG_KEY_FRAME)) as i64
+            };
+            // WebCodecs(WebView2) 只接受 avcC description + 4 字节长度前缀块：
+            // config 包在 Rust 侧解析出 avcC/codec（经 WS info 下发），媒体帧转 avcc
+            if kind == 0 {
+                if let Some(info) = build_avc_info(&payload) {
+                    *avcc_info.lock().unwrap() = Some(info);
+                }
+                continue;
+            }
+            let avcc_payload = annexb_to_avcc(&payload);
+            let mut chunk = Vec::with_capacity(CHUNK_HEADER_LEN + avcc_payload.len());
             chunk.push(kind);
             chunk.extend_from_slice(&(pts as i64).to_be_bytes());
-            chunk.extend_from_slice(&payload);
-            if kind == 0 {
-                *config_cache.lock().unwrap() = Some(chunk.clone());
+            chunk.extend_from_slice(&avcc_payload);
+            if kind == 1 {
+                *last_key.lock().unwrap() = Some(chunk.clone());
             }
             if video_tx.send(chunk).is_err() {
                 break; // 无订阅者（UI 已关闭）
@@ -418,6 +514,8 @@ pub async fn start_session(
         info: VideoInfo { codec, width, height },
         video_rx,
         config_cache,
+        avcc_info,
+        last_key,
         events_rx,
         ctl,
         state_rx,

@@ -35,6 +35,26 @@ export class MirrorView {
   private moveScheduled = false;
   private unlistenDrag: (() => void) | null = null;
 
+  // 诊断
+  private hudLog: string[] = [];
+  private cntKey = 0;
+  private cntDelta = 0;
+  private decCount = 0;
+  private errCount = 0;
+  private skipCount = 0;
+  private firstDecodeErr = false;
+
+  private hudUpdate(extra = "", keep = true) {
+    this.hud.classList.remove("hidden");
+    if (keep) {
+      this.hudLog.push(extra);
+      if (this.hudLog.length > 4) this.hudLog.shift();
+    }
+    this.hud.textContent =
+      `key=${this.cntKey} delta=${this.cntDelta} dec=${this.decCount} skip=${this.skipCount} err=${this.errCount} state=${this.decoder?.state ?? "null"} | ` +
+      this.hudLog.join(" | ");
+  }
+
   constructor() {
     this.stage.append(this.canvas, this.hud, this.overlay);
     this.bindInput();
@@ -94,7 +114,14 @@ export class MirrorView {
       if (typeof ev.data === "string") {
         try {
           const j = JSON.parse(ev.data);
-          if (j.info) { this.info = j.info; this.fitCanvas(); }
+          if (j.info) {
+            this.info = j.info;
+            this.fitCanvas();
+            // Rust 端已把 SPS/PPS 转为 avcC description：先配置解码器再等流
+            if (j.info.descriptionB64 && j.info.codec) {
+              this.configureFromDescription(j.info.codec, j.info.descriptionB64);
+            }
+          }
         } catch { /* ignore */ }
         return;
       }
@@ -109,234 +136,76 @@ export class MirrorView {
     };
   }
 
-  private avcCDescription(configPayload: Uint8Array): { avcC: Uint8Array; codec: string } | null {
-    // Annex-B config 包 -> avcC 盒（mp4 风格），并提取 profile 构造 codec 串
-    const nals: Uint8Array[] = [];
-    let i = 0;
-    while (i < configPayload.length) {
-      if (configPayload[i] === 0 && configPayload[i + 1] === 0 && configPayload[i + 2] === 1) {
-        const nalStart = i + 3;
-        let j = nalStart;
-        while (j < configPayload.length - 2) {
-          if (configPayload[j] === 0 && configPayload[j + 1] === 0 && (configPayload[j + 2] === 1 || configPayload[j + 3] === 1)) break;
-          j++;
-        }
-        const end = j < configPayload.length - 2 ? (configPayload[j + 2] === 1 ? j : j + 1) : configPayload.length;
-        nals.push(configPayload.subarray(nalStart, end));
-        i = end;
-      } else {
-        i++;
-      }
-    }
-    const sps = nals.find((n) => (n[0] & 0x1f) === 7);
-    const pps = nals.find((n) => (n[0] & 0x1f) === 8);
-    if (!sps || !pps) return null;
-    const hex = (b: number) => b.toString(16).padStart(2, "0").toUpperCase();
-    const codec = `avc1.${hex(sps[1])}${hex(sps[2])}${hex(sps[3])}`;
-    // avcC: configurationVersion(1) profile compat level 0xFF | numOfSPS 0xE1 | len u16 sps | numOfPPS 1 | len u16 pps
-    const out = new Uint8Array(11 + sps.length + pps.length);
-    let o = 0;
-    out[o++] = 1; out[o++] = sps[1]; out[o++] = sps[2]; out[o++] = sps[3];
-    out[o++] = 0xff; out[o++] = 0xe1;
-    out[o++] = (sps.length >> 8) & 0xff; out[o++] = sps.length & 0xff;
-    out.set(sps, o); o += sps.length;
-    out[o++] = 1;
-    out[o++] = (pps.length >> 8) & 0xff; out[o++] = pps.length & 0xff;
-    out.set(pps, o);
-    return { avcC: out, codec };
-  }
-
-  /** Annex-B -> avcc（4 字节大端长度前缀） */
-  private annexbToAvcc(payload: Uint8Array): Uint8Array {
-    const nals: Uint8Array[] = [];
-    let i = 0;
-    const starts: number[] = [];
-    while (i < payload.length) {
-      if (payload[i] === 0 && payload[i + 1] === 0 && payload[i + 2] === 1) {
-        starts.push(i + 3);
-        i += 3;
-      } else {
-        i++;
-      }
-    }
-    for (let k = 0; k < starts.length; k++) {
-      const end = k + 1 < starts.length ? this.prevStart(starts, k + 1, payload) : payload.length;
-      nals.push(payload.subarray(starts[k], end));
-    }
-    let total = 0;
-    for (const n of nals) total += 4 + n.length;
-    const out = new Uint8Array(total);
-    let o = 0;
-    for (const n of nals) {
-      out[o++] = (n.length >>> 24) & 0xff;
-      out[o++] = (n.length >>> 16) & 0xff;
-      out[o++] = (n.length >>> 8) & 0xff;
-      out[o++] = n.length & 0xff;
-      out.set(n, o);
-      o += n.length;
-    }
-    return out;
-  }
-
-  /** 找 starts[k] 的结束位置（下一个起始码处，含 00 00 00 01 的前导 0） */
-  private prevStart(starts: number[], k: number, payload: Uint8Array): number {
-    const next = starts[k];
-    // 回退 00 00 00 01 的额外 0
-    let end = next;
-    let z = 0;
-    let p = next - 3; // 至少留 00 00 01
-    while (p - 1 >= 0 && payload[p - 1] === 0) { z++; p--; }
-    return next - 3 - z;
-  }
-
-  private ensureDecoder(configPayload: Uint8Array) {
+  /** 解析 Annex-B：返回每个 NAL 的视图（正确处理 3/4 字节起始码与跨界前导零） */
+  /** 用 Rust 端下发的 avcC description 配置解码器（WebView2 仅接受此形态） */
+  private configureFromDescription(codec: string, descriptionB64: string) {
     if (this.decoder && this.decoder.state === "configured") return;
     if (typeof VideoDecoder === "undefined") {
       toast("当前 WebView 不支持 WebCodecs", "请更新系统 WebView2", true);
       return;
     }
-    const parsed = this.avcCDescription(configPayload);
-    if (!parsed) {
-      this.hudUpdate("config 包中未找到 SPS/PPS");
-      return;
-    }
+    const bin = atob(descriptionB64);
+    const desc = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) desc[i] = bin.charCodeAt(i);
     this.decoder = new VideoDecoder({
       output: (frame) => this.onFrame(frame),
       error: (e) => {
-        this.hudUpdate(`err=${e}`);
+        this.hudUpdate(`err=${e}`, false);
         toast("解码器错误", String(e), true);
       },
     });
     try {
       this.decoder.configure({
-        codec: parsed.codec,
-        description: parsed.avcC as BufferSource,
+        codec,
+        description: desc as BufferSource,
         optimizeForLatency: true, // 关键：<80ms 延迟
       });
-      this.hudUpdate(`configure ${parsed.codec} desc=${parsed.avcC.length}B`);
+      this.hudUpdate(`configure ${codec} desc=${desc.length}B`);
     } catch (e) {
       this.hudUpdate(`configure 异常: ${e}`);
       toast("解码器配置失败", String(e), true);
     }
   }
 
-  /** 从 Annex-B SPS 解析 profile/constraint/level，构造精确的 codec 串 */
-  private codecFromSps(payload: Uint8Array): string | undefined {
-    // 找 00 00 01 或 00 00 00 01 起始码后的 NAL
-    let i = 0;
-    while (i < payload.length - 4) {
-      if (payload[i] === 0 && payload[i + 1] === 0 && payload[i + 2] === 1) {
-        // NAL 布局：[起始码 00 00 01][NAL头][profile][compat][level]...
-        const nal = payload[i + 3];
-        if ((nal & 0x1f) === 7 && i + 7 <= payload.length) {
-          const p = payload[i + 4], c = payload[i + 5], l = payload[i + 6];
-          const hex = (b: number) => b.toString(16).padStart(2, "0").toUpperCase();
-          return `avc1.${hex(p)}${hex(c)}${hex(l)}`;
-        }
-        i += 3;
-      } else {
-        i++;
-      }
-    }
-    return undefined;
-  }
-
-  private firstChunkSeen = false;
-  private decodedCount = 0;
-  private cntConfig = 0;
-  private cntKey = 0;
-  private cntDelta = 0;
-  /** configure() 异步生效期间到达的块，configured 后按序补喂 */
-  private pendingChunks: { kind: number; pts: number; payload: Uint8Array }[] = [];
-  private flushing = false;
-
-  private hudLog: string[] = [];
-  private hudUpdate(extra = "") {
-    this.hud.classList.remove("hidden");
-    this.hudLog.push(extra);
-    if (this.hudLog.length > 6) this.hudLog.shift();
-    this.hud.textContent =
-      `cfg=${this.cntConfig} key=${this.cntKey} delta=${this.cntDelta} dec=${this.decodedCount} state=${this.decoder?.state ?? "null"} | ` +
-      this.hudLog.join(" | ");
-  }
-
   private onChunk(buf: Uint8Array) {
     if (buf.length < 9) return;
     const kind = buf[0];
-    if (kind === 0) this.cntConfig++;
-    else if (kind === 1) this.cntKey++;
-    else this.cntDelta++;
-    this.hudUpdate();
-    const pts = Number(new DataView(buf.buffer, buf.byteOffset, buf.byteLength).getBigInt64(1, false));
+    const pts = Number(
+      new DataView(buf.buffer, buf.byteOffset, buf.byteLength).getBigInt64(1, false),
+    );
     const payload = buf.subarray(9);
-    try {
-      if (kind === 0) {
-        this.ensureDecoder(payload);
-        return;
-      }
-      if (!this.decoder || this.decoder.state !== "configured") {
-        // configure() 异步生效：先缓存媒体块（等首个 key 帧后由门控保证有序），就绪后补喂
-        if (kind !== 0) {
-          if (this.pendingChunks.length > 120) this.pendingChunks.shift();
-          this.pendingChunks.push({ kind, pts, payload });
-          this.tryFlushPending();
-        }
-        return;
-      }
-      this.tryFlushPending();
-      if (!this.decoder || this.decoder.state !== "configured") {
-        this.hudUpdate(`skip kind=${kind} (not configured)`);
-        return;
-      }
-      let chunk: EncodedVideoChunk;
-      try {
-        chunk = new EncodedVideoChunk({
-          type: kind === 1 ? "key" : "delta",
-          timestamp: pts,
-          data: this.annexbToAvcc(payload) as BufferSource,
-        });
-      } catch (e) {
-        this.hudUpdate(`chunkErr kind=${kind}: ${e}`);
-        return;
-      }
-      try {
-        this.decoder.decode(chunk);
-        this.decodedCount++;
-        this.hudUpdate(`decoded kind=${kind} sz=${payload.length} q=${this.decoder.decodeQueueSize}`);
-      } catch (e) {
-        this.hudUpdate(`decodeErr kind=${kind}: ${e}`);
-      }
-      // 延迟估计：解码时间戳与本地时钟差（近似）
-      if (pts > 0) {
-        const nowUs = performance.now() * 1000;
-        const d = Math.abs(nowUs - pts) / 1e6;
-        if (d < 5000) this.latencyEMA = this.latencyEMA * 0.9 + d * 0.1;
-      }
-    } catch (e) {
-      console.error("chunk", e);
+    if (kind === 1) this.cntKey++;
+    else if (kind === 2) this.cntDelta++;
+    this.hudUpdate("", false);
+    // 数据已是 avcc 格式（Rust 端转换）；config 包不再进流（description 走 info）
+    if (!this.decoder || this.decoder.state !== "configured") {
+      // 编码器每秒出一个 IDR：未就绪时直接丢弃，等下一个 key 帧即可
+      this.skipCount++;
+      this.hudUpdate(`skip kind=${kind}`, false);
+      return;
     }
-  }
-
-  /** decoder configured 后按序补喂缓存的媒体块 */
-  private tryFlushPending() {
-    if (this.flushing || !this.decoder || this.decoder.state !== "configured") return;
-    this.flushing = true;
     try {
-      while (this.pendingChunks.length && this.decoder.state === "configured") {
-        const c = this.pendingChunks.shift()!;
-        const chunk = new EncodedVideoChunk({
-          type: c.kind === 1 ? "key" : "delta",
-          timestamp: c.pts,
-          data: this.annexbToAvcc(c.payload) as BufferSource,
-        });
-        this.decoder.decode(chunk);
-        this.decodedCount++;
-        this.hudUpdate(`flushed kind=${c.kind} sz=${c.payload.length} q=${this.decoder.decodeQueueSize}`);
-      }
+      const chunk = new EncodedVideoChunk({
+        type: kind === 1 ? "key" : "delta",
+        timestamp: pts,
+        data: payload as BufferSource,
+      });
+      this.decoder.decode(chunk);
+      this.decCount++;
+      if (this.decCount === 1) this.hudUpdate("首块已解码");
     } catch (e) {
-      this.hudUpdate(`flushErr=${e}`);
+      if (this.decCount === 0 && !this.firstDecodeErr) {
+        this.firstDecodeErr = true;
+        this.hudUpdate(`decodeErr#${kind}: ${String(e).slice(0, 160)}`);
+      }
+      this.hudUpdate("", false);
     }
-    this.flushing = false;
+    // 延迟估计：解码时间戳与本地时钟差（近似）
+    if (pts > 0) {
+      const nowUs = performance.now() * 1000;
+      const d = Math.abs(nowUs - pts) / 1e6;
+      if (d < 5000) this.latencyEMA = this.latencyEMA * 0.9 + d * 0.1;
+    }
   }
 
   private onFrame(frame: VideoFrame) {
