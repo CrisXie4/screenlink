@@ -1,0 +1,15 @@
+{
+  "identifier": "default",
+  "description": "ScreenLink main window permissions",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "core:event:default",
+    "core:window:default",
+    "core:webview:default",
+    "core:app:default",
+    "dialog:default",
+    "notification:default",
+    "opener:default"
+  ]
+}

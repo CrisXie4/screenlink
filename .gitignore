@@ -1,0 +1,10 @@
+/target
+crates/*/target
+node_modules/
+ui/dist/
+*.log
+.DS_Store
+assets/*.jar.tmp
+
+# Tauri 自动生成
+crates/screenlink-app/gen/
