@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+    <uses-permission android:name="android.permission.INTERNET" />
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.ACCESS_WIFI_STATE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+    <application
+        android:name=".ScreenLinkApp"
+        android:allowBackup="false"
+        android:icon="@mipmap/ic_launcher"
+        android:label="@string/sl_app_name"
+        android:theme="@style/Theme.ScreenLink">
+
+        <!-- 启动页 -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity>
+
+        <!-- 系统分享「发送到电脑」：SEND / SEND_MULTIPLE，任意 MIME -->
+        <activity
+            android:name=".share.SendToPcActivity"
+            android:exported="true"
+            android:excludeFromRecents="true"
+            android:label="@string/sl_share_send_to_pc"
+            android:theme="@style/Theme.ScreenLink.Dialog">
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+            <intent-filter>
+                <action android:name="android.intent.action.SEND_MULTIPLE" />
+                <category android:name="android.intent.category.DEFAULT" />
+                <data android:mimeType="*/*" />
+            </intent-filter>
+        </activity>
+
+        <!-- 前台 AgentService：TCP 监听 27188 + 传输进度通知 -->
+        <service
+            android:name=".service.AgentService"
+            android:exported="false"
+            android:foregroundServiceType="specialUse">
+            <property
+                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
+                android:value="Local PC companion link: keeps a TCP listener on port 27188 for paired-PC file transfer and shows transfer progress notifications" />
+        </service>
+
+        <!-- Shizuku 提权 Provider（官方固定写法） -->
+        <provider
+            android:name="rikka.shizuku.ShizukuProvider"
+            android:authorities="${applicationId}.shizuku"
+            android:multiprocess="false"
+            android:enabled="true"
+            android:exported="true"
+            android:permission="android.permission.INTERACT_ACROSS_USERS_FULL" />
+    </application>
+
+    <!-- Android 11+ 包可见性：Shizuku 管理器 -->
+    <queries>
+        <package android:name="moe.shizuku.privileged.api" />
+    </queries>
+</manifest>
