@@ -66,7 +66,12 @@ class AgentService : Service() {
             ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
         )
 
-        AgentServer.start(this)
+        // Shizuku shell 模式：27188 归 shell 进程的 AgentMain，内置 server 不启动
+        if (!dev.screenlink.companion.shizuku.AgentModePrefs.isShellMode(this)) {
+            AgentServer.start(this)
+        } else {
+            android.util.Log.i("AgentService", "shell agent 模式：内置 AgentServer 跳过")
+        }
 
         AgentServer.state
             .onEach { state ->

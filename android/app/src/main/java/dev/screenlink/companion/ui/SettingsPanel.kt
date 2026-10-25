@@ -24,6 +24,7 @@ import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -38,8 +39,11 @@ import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import dev.screenlink.companion.R
+import dev.screenlink.companion.net.PairingStore
 import dev.screenlink.companion.shizuku.ScrcpyLauncher
 import dev.screenlink.companion.shizuku.ScrcpyState
+import dev.screenlink.companion.shizuku.AgentModePrefs
+import dev.screenlink.companion.shizuku.AgentShell
 import dev.screenlink.companion.shizuku.ShizukuGate
 import dev.screenlink.companion.shizuku.ShizukuStatus
 import dev.screenlink.companion.shizuku.WirelessDebugEnabler
@@ -342,6 +346,86 @@ fun SettingsPanel(vm: MainViewModel) {
                             }
                         }
                     }
+                }
+            }
+        }
+
+        // ---- Shell 直连（Shizuku 模式）：冻结免疫的传输 agent ----
+        Card(modifier = Modifier.fillMaxWidth()) {
+            Column(
+                modifier = Modifier.padding(16.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Text(text = "Shell 直连模式", style = MaterialTheme.typography.titleMedium)
+                var shellAlive by remember { mutableStateOf(false) }
+                var shellBusy by remember { mutableStateOf(false) }
+                LaunchedEffect(Unit) {
+                    while (true) {
+                        shellAlive = AgentShell(context).isAlive()
+                        kotlinx.coroutines.delay(2000)
+                    }
+                }
+                Text(
+                    text = when {
+                        shellAlive -> "运行中（shell 进程，息屏/后台均不掉线）"
+                        shizukuStatus is ShizukuStatus.Authorized -> "未运行"
+                        else -> "需要 Shizuku 授权"
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = if (shellAlive) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(
+                    text = "以 shell 身份常驻传输服务：微信/QQ 在前台时收到电脑文件会直接弹出分享，" +
+                        "文件保存到 Download/ScreenLink（无需选择 SAF 目录）。",
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+                    Button(
+                        enabled = shizukuStatus is ShizukuStatus.Authorized && !shellBusy && !shellAlive,
+                        onClick = {
+                            scope.launch {
+                                shellBusy = true
+                                val shell = AgentShell(context)
+                                runCatching { shell.install() }
+                                val shas = PairingStore(context).allTokenShas()
+                                val ok = if (shas.isEmpty()) false else shell.start(shas.joinToString(","))
+                                if (!ok) {
+                                    android.widget.Toast.makeText(
+                                        context, "启动失败（见 logcat / agent 日志）", android.widget.Toast.LENGTH_LONG,
+                                    ).show()
+                                }
+                                shellBusy = false
+                                AgentModePrefs.set(context, ok)
+                            }
+                        },
+                    ) { Text(text = "启动") }
+                    OutlinedButton(
+                        enabled = shellAlive && !shellBusy,
+                        onClick = {
+                            scope.launch {
+                                shellBusy = true
+                                AgentShell(context).stop()
+                                AgentModePrefs.set(context, false)
+                                shellBusy = false
+                            }
+                        },
+                    ) { Text(text = "停止") }
+                }
+
+                // ② 无 Shizuku 时的降级：跳转应用信息页让用户手动设省电策略
+                if (shizukuStatus != ShizukuStatus.Authorized) {
+                    Text(
+                        text = "没有 Shizuku？请把本应用的「省电策略」设为无限制，并允许后台运行，" +
+                            "否则系统会冻结传输服务。",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                    OutlinedButton(onClick = {
+                        val i = android.content.Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS)
+                        i.data = android.net.Uri.fromParts("package", context.packageName, null)
+                        context.startActivity(i)
+                    }) { Text(text = "打开省电策略设置") }
                 }
             }
         }

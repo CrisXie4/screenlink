@@ -47,6 +47,14 @@ class PairingStore(context: Context) {
     /** 是否已配对过任意 PC（用于 UI 提示，不参与协议）。 */
     fun hasAnyToken(): Boolean = prefs.all?.keys?.any { it.startsWith(KEY_TOKEN_PREFIX) } == true
 
+    /** 全部已配对 token 的 sha 列表（shell 模式 agent 用：任一命中即认证通过）。 */
+    fun allTokenShas(): List<String> =
+        prefs.all?.keys
+            ?.filter { it.startsWith(KEY_TOKEN_PREFIX) }
+            ?.mapNotNull { prefs.getString(it, null) }
+            ?.map { it.lowercase() }
+            ?: emptyList()
+
     private fun tokenKey(tokenId: String) = "$KEY_TOKEN_PREFIX$tokenId"
 
     private fun newInstanceId(): String {
