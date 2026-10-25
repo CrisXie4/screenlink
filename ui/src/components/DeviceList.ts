@@ -16,7 +16,8 @@ export function createDeviceBar(h: DeviceListHandlers) {
   // ---- 渲染 ----
   function render() {
     list.innerHTML = "";
-    const sel = store.selected;
+    // 连接中：高亮跟随已连接设备；空闲：跟随手动选中项
+    const sel = store.conn.phase !== "idle" && store.conn.serial ? store.conn.serial : store.selected;
     const online = store.devices.filter((d) => d.state === "online");
     const others = store.devices.filter((d) => d.state !== "online");
 
@@ -72,6 +73,10 @@ export function createDeviceBar(h: DeviceListHandlers) {
 
   function card(d: DeviceInfo, selected: boolean): HTMLElement {
     const online = d.state === "online";
+    // 无线调试 mDNS serial 过长且无意义：显示友好文案
+    const meta1 = d.serial.includes("_tcp")
+      ? "无线调试"
+      : d.serial;
     const c = el("div", {
       class: `device-card${selected ? " selected" : ""}`,
       onclick: () => h.onSelect(d.serial),
@@ -85,7 +90,7 @@ export function createDeviceBar(h: DeviceListHandlers) {
         ),
       ),
       el("div", { class: "meta" },
-        el("span", {}, d.serial),
+        el("span", {}, meta1),
         d.battery != null ? el("span", { style: "display:inline-flex;align-items:center;gap:3px" }, iconEl("battery", 11), `${d.battery}%`) : null,
         online ? null : el("span", { class: "chip off" }, d.state === "unauthorized" ? "未授权" : "离线"),
       ),

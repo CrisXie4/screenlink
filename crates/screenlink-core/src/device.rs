@@ -83,7 +83,12 @@ pub fn parse_devices_line(line: &str) -> Option<DeviceInfo> {
     }
     let transport = if serial.starts_with("emulator-") {
         Transport::Emulator
-    } else if serial.contains(':') && serial.split(':').nth(1).map(|p| p.parse::<u16>().is_ok()).unwrap_or(false) {
+    } else if serial.contains("_tcp")
+        || serial.starts_with("adb-")
+        || (serial.contains(':')
+            && serial.split(':').nth(1).map(|p| p.parse::<u16>().is_ok()).unwrap_or(false))
+    {
+        // 无线两类：经典 ip:端口（adb tcpip）与无线调试 mDNS 名（adb-xxx_adb-tls-connect._tcp）
         Transport::Wifi
     } else {
         Transport::Usb
@@ -150,5 +155,27 @@ fn capitalize(s: &str) -> String {
     match c.next() {
         Some(f) => f.to_uppercase().collect::<String>() + c.as_str(),
         None => String::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transport_classification() {
+        let parse = |line: &str| parse_devices_line(line).unwrap().transport;
+        // USB 物理设备
+        assert_eq!(parse("abc123 device usb:1-2 product:p model:Pixel device:d transport_id:1"), Transport::Usb);
+        // 经典无线 ip:port
+        assert_eq!(parse("192.168.10.20:5555 device transport_id:2"), Transport::Wifi);
+        // 安卓 11+ 无线调试（mDNS/TLS）：不能误判为 USB
+        assert_eq!(
+            parse("adb-3f4AP06Y3001JX-SP4PON_adb-tls-connect._tcp device transport_id:3"),
+            Transport::Wifi
+        );
+        assert_eq!(parse("adb-1a2b3c4d-5e6f._adb-tls-connect._tcp device transport_id:4"), Transport::Wifi);
+        // 模拟器
+        assert_eq!(parse("emulator-5554 device transport_id:5"), Transport::Emulator);
     }
 }

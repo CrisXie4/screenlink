@@ -19,6 +19,10 @@ const canvas = new ScreenCanvas({
     if (store.conn.phase !== "connected") {
       store.conn.phase = "connected";
       store.conn.step = "";
+      if (pendingSwitchToast) {
+        pendingSwitchToast = false;
+        toast("已切换", `当前投屏：${currentName()}`);
+      }
       notify();
     }
   },
@@ -39,8 +43,13 @@ const canvasEl = canvas;
 
 const deviceBar = createDeviceBar({
   onSelect: (serial) => {
+    const switching = store.conn.phase !== "idle" && store.conn.serial !== serial;
     store.selected = serial;
     notify();
+    if (switching) {
+      const d = store.devices.find((x) => x.serial === serial);
+      toast("已选择设备", `正在投屏「${currentName()}」，点顶部「连接」切换到「${d ? d.model : serial}」`);
+    }
   },
   onConnect: (serial) => connectDevice(serial),
 });
@@ -49,11 +58,25 @@ const queue = new TransferQueue();
 
 // ---- 连接控制 ----
 let connecting = false;
+let pendingSwitchToast = false;
+
+function currentName(): string {
+  const d = store.devices.find((x) => x.serial === store.conn.serial);
+  return d ? d.model : store.conn.serial ?? "";
+}
 
 async function connectDevice(serial: string) {
   const d = store.devices.find((x) => x.serial === serial);
   if (!d || d.state !== "online" || connecting) return;
+  const isSwitch =
+    (store.conn.phase === "connected" || store.conn.phase === "connecting") &&
+    store.conn.serial !== serial;
+  if (isSwitch) {
+    // 切换 = 自动断开旧会话再连接新设备（避免静默失败）
+    toast("正在切换", `断开「${currentName()}」并连接「${d.model}」`);
+  }
   connecting = true;
+  pendingSwitchToast = isSwitch;
   store.selected = serial;
   store.conn = { phase: "connecting", serial, step: "正在启动服务…" };
   notify();

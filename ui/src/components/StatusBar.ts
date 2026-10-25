@@ -47,7 +47,12 @@ export function renderStatusBar(root: HTMLElement, h: StatusBarHandlers) {
 
   // 连接/断开按钮
   let action: HTMLElement;
-  if (phase === "connected") {
+  // 已连接时选中了另一台设备：按钮变为「切换到 XX」（一键断旧连新）
+  if (phase === "connected" && store.selected && store.selected !== store.conn.serial) {
+    const d = selectedDevice();
+    action = el("button", { class: "primary", onclick: () => h.onConnect() },
+      iconEl("play", 13), document.createTextNode(`切换到 ${d ? d.model : ""}`));
+  } else if (phase === "connected") {
     action = el("button", { class: "primary", onclick: () => h.onDisconnect() },
       iconEl("unplug", 13), document.createTextNode("断开连接"));
   } else if (phase === "connecting") {

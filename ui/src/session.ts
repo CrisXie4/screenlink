@@ -196,6 +196,16 @@ export class MirrorSession {
       this.canvas.width = w;
       this.canvas.height = h;
     }
+    // 显示尺寸由 JS 显式设定并严格保持纵横比：
+    // 依赖 CSS max-width/max-height 会被网格布局拉伸成非原始比例
+    const area = this.canvas.parentElement;
+    if (area && area.clientHeight > 0) {
+      const availW = Math.max(120, area.clientWidth - 48);
+      const availH = Math.max(120, area.clientHeight - 48);
+      const scale = Math.min(availW / w, availH / h, 2.0);
+      this.canvas.style.width = `${Math.round(w * scale)}px`;
+      this.canvas.style.height = `${Math.round(h * scale)}px`;
+    }
   }
 
   // ---- 画布坐标 -> 设备坐标 ----
