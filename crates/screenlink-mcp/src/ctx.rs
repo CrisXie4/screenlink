@@ -75,7 +75,7 @@ pub async fn tool_screenshot(ctx: &Ctx, params: Value) -> Result<(Value, bool)> 
         let ms = v.get("ms").and_then(|m| m.as_u64()).unwrap_or(0);
         return Ok((json!({
             "content": [{ "type": "image", "mimeType": mime, "data": data },
-                        { "type": "text", "text": format!("截图耗时 {ms}ms (via GUI 投屏帧)") }]
+                        { "type": "text", "text": format!("截图耗时 {ms}ms (via GUI IPC, source={})", v.get("source").and_then(|x| x.as_str()).unwrap_or("unknown")) }]
         }), true));
     }
     // 慢路径：adb screencap

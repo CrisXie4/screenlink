@@ -195,6 +195,25 @@ impl IpcClient {
         .map_err(|_| anyhow!("GUI IPC 不可达"))??;
         s.set_nodelay(true).ok();
         let (mut rd, mut wr) = s.into_split();
+        // GUI 侧要求首条消息为 hello 鉴权，随后才是业务请求
+        let hello = json!({
+            "id": "hello",
+            "method": "hello",
+            "params": { "token": self.token },
+        });
+        wr.write_all((hello.to_string() + "
+").as_bytes()).await?;
+        let mut ack = String::new();
+        BufReader::new(&mut rd).read_line(&mut ack).await?;
+        let ack_v: Value = serde_json::from_str(&ack)?;
+        if ack_v
+            .get("error")
+            .filter(|e| !e.is_null())
+            .is_some()
+        {
+            let msg = ack_v["error"]["message"].as_str().unwrap_or("IPC 鉴权失败");
+            return Err(anyhow!("{msg}"));
+        }
         wr.write_all(payload.as_bytes()).await?;
         wr.flush().await?;
         let mut reader = BufReader::new(rd);
