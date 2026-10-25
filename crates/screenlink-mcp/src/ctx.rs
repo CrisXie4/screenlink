@@ -29,6 +29,7 @@ impl Ctx {
     }
 
     /// 解析目标设备：显式 serial > IPC/GUI 活跃会话 > 首个在线设备。
+    /// 首次解析后缓存（auto 语义：会话期间锁定该设备，避免每次全量设备查询的 ~400ms）。
     async fn resolve_serial(&self, params: &Value) -> Result<String> {
         if let Some(s) = params.get("serial").and_then(|s| s.as_str()) {
             if !s.is_empty() {
@@ -38,6 +39,12 @@ impl Ctx {
         if let Some(d) = self.device.read().await.as_ref() {
             return Ok(d.clone());
         }
+        let resolved = self.resolve_serial_uncached(params).await?;
+        *self.device.write().await = Some(resolved.clone());
+        Ok(resolved)
+    }
+
+    async fn resolve_serial_uncached(&self, params: &Value) -> Result<String> {
         // GUI 活跃会话优先（输入走 <20ms 快速通道）
         if self.ipc.has_token() {
             if let Ok(v) = self.ipc.request("devices", json!({})).await {
