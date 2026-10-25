@@ -403,6 +403,8 @@ object AgentServer {
         } catch (e: Throwable) {
             // 单连接故障不拖垮服务（SupervisorJob）；兜底吞掉占位模块抛出的 NotImplementedError 等
             Log.w(TAG, "连接处理异常：${e.javaClass.simpleName}: ${e.message}")
+            // PROTOCOL §5.6：严重错误发 ERR{INTERNAL} 后关闭（尽力而为，链路可能已死）
+            runCatching { fatal(link, "INTERNAL", e.message ?: "internal error") }
         } finally {
             links.remove(link)
             if (!link.authed) unauthCount.decrementAndGet()

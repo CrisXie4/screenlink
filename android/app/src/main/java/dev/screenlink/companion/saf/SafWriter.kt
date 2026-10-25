@@ -34,9 +34,15 @@ class SafWriter(private val store: SafStore, private val resolver: ContentResolv
                 displayName != ".."
         ) { "invalid display name: $displayName" } // PROTOCOL.md §5.3 name 净化：协议层拒绝之外的第二道防线
         val tree = requireTree()
+        // createDocument 要求 document uri：必须用 buildDocumentUriUsingTree 从树根转换，
+        // 直接传 tree uri 会抛 IllegalArgumentException("Invalid URI")
+        val rootDoc = DocumentsContract.buildDocumentUriUsingTree(
+            tree,
+            DocumentsContract.getTreeDocumentId(tree),
+        )
         val created = DocumentsContract.createDocument(
             resolver,
-            tree,
+            rootDoc,
             mime.ifBlank { DEFAULT_MIME },
             displayName,
         )
