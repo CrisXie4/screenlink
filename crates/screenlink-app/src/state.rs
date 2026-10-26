@@ -18,6 +18,8 @@ pub struct Settings {
     /// 视频码率 bps
     pub bit_rate: i32,
     pub max_fps: f32,
+    /// 关键帧间隔（秒）：1 = 中途接入秒级恢复；低配设备可放宽到 4 降负载
+    pub keyframe_interval: i32,
     /// 推送默认目录
     pub push_dir: String,
     /// 拉取默认目录（空 = 下载目录）
@@ -36,6 +38,7 @@ impl Default for Settings {
             max_size: 1600,
             bit_rate: 12_000_000,
             max_fps: 60.0,
+            keyframe_interval: 1,
             push_dir: "/sdcard/Download/ScreenLink".into(),
             pull_dir: String::new(),
             clipboard_sync: true,
@@ -145,6 +148,7 @@ impl AppState {
             max_size: st.max_size,
             bit_rate: st.bit_rate,
             max_fps: st.max_fps,
+            keyframe_interval: st.keyframe_interval.max(1),
             audio: false,
             stay_awake: true,
             show_touches: false,

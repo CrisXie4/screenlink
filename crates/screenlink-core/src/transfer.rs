@@ -1,10 +1,16 @@
-//! 文件传输：任务队列 + 进度 + 冲突策略（覆盖/跳过/重命名）。
+//! 文件传输：任务队列 + 进度 + 冲突策略（覆盖/跳过/重命名）+ 失败重试。
 //!
 //! 通道设计：
 //! - USB / WiFi 均走 `adb push/pull`（ADB over TCP/IP 下依旧可用，进度可解析）。
 //! - 预留 `run_job` 内部按 transport 分派自建 TCP 高速通道的扩展位
 //!   （手机端 agent 上线后启用，目标 >80MB/s 与断点续传）。
-//! - 冲突策略：push 时对远端同名文件处理；pull 时对本地同名文件处理。
+//!
+//! 可靠性设计（push）：
+//! - 逐文件传输：单个文件失败不影响其余文件，且进度连续；
+//! - 原子落盘：先推到远端 `.sl-part-<name>`，成功后 `mv` 改名 ——
+//!   中断不会留下"看起来完整"的半截文件；
+//! - 失败自动重试 1 次（瞬时 USB 抖动 / WiFi 丢包场景）；
+//! - 文件夹拖拽：入队前展开为文件清单 + 相对路径，远端自动 `mkdir -p`。
 
 use crate::adb::{Adb, CancelToken};
 use serde::Serialize;
@@ -63,14 +69,19 @@ pub struct TransferManager {
     next_id: Arc<AtomicU64>,
     tx: mpsc::UnboundedSender<PendingJob>,
     cancels: Arc<Mutex<HashMap<u64, CancelToken>>>,
+    /// 已入队任务的原参数（失败重试时重建）；同步锁：retry() 为同步入口
+    jobs: Arc<std::sync::Mutex<HashMap<u64, PendingJob>>>,
     snapshots_tx: Arc<watch::Sender<Vec<JobSnapshot>>>,
 }
 
+#[derive(Debug, Clone)]
 struct PendingJob {
     id: u64,
     kind: JobKind,
     serial: String,
     files: Vec<PathBuf>,
+    /// 与 files 一一对应的远端相对路径（文件夹拖拽时含子目录）
+    rel_paths: Vec<String>,
     remote: String,
     local_dir: PathBuf,
     policy: ConflictPolicy,
@@ -85,6 +96,7 @@ impl TransferManager {
             next_id: Arc::new(AtomicU64::new(1)),
             tx,
             cancels: Arc::new(Mutex::new(HashMap::new())),
+            jobs: Arc::new(std::sync::Mutex::new(HashMap::new())),
             snapshots_tx: Arc::new(snap_tx),
         };
         mgr.spawn_worker(rx);
@@ -100,11 +112,13 @@ impl TransferManager {
     }
 
     /// 入队传输任务（同一设备内 adb 串行执行，不同设备并行）。
+    #[allow(clippy::too_many_arguments)]
     pub fn enqueue(
         &self,
         kind: JobKind,
         serial: &str,
         files: Vec<PathBuf>,
+        rel_paths: Vec<String>,
         remote: &str,
         local_dir: PathBuf,
         policy: ConflictPolicy,
@@ -116,10 +130,7 @@ impl TransferManager {
             .map(|m| m.len())
             .sum();
         let title = match kind {
-            JobKind::Push => format!(
-                "发送 {} 个文件到手机",
-                files.len()
-            ),
+            JobKind::Push => format!("发送 {} 个文件到手机", files.len()),
             JobKind::Pull => format!("接收 {}", remote.rsplit('/').next().unwrap_or(remote)),
         };
         self.update_snap(id, |s| {
@@ -138,16 +149,46 @@ impl TransferManager {
                 file_count: files.len(),
             };
         });
-        let _ = self.tx.send(PendingJob {
+        let job = PendingJob {
             id,
             kind,
             serial: serial.to_string(),
             files,
+            rel_paths,
             remote: remote.to_string(),
             local_dir,
             policy,
-        });
+        };
+        if let Ok(mut map) = self.jobs.lock() {
+            map.insert(id, job.clone());
+        }
+        let _ = self.tx.send(job);
         id
+    }
+
+    /// 重试历史任务：以原参数重新入队，返回新任务 id。
+    pub fn retry(&self, id: u64) -> Option<u64> {
+        let job = self.jobs.lock().ok()?.get(&id)?.clone();
+        Some(match job.kind {
+            JobKind::Push => self.enqueue(
+                JobKind::Push,
+                &job.serial,
+                job.files.clone(),
+                job.rel_paths.clone(),
+                &job.remote,
+                job.local_dir.clone(),
+                job.policy,
+            ),
+            JobKind::Pull => self.enqueue(
+                JobKind::Pull,
+                &job.serial,
+                vec![],
+                job.rel_paths.clone(),
+                &job.remote,
+                job.local_dir.clone(),
+                job.policy,
+            ),
+        })
     }
 
     pub async fn cancel(&self, id: u64) {
@@ -264,130 +305,350 @@ async fn run_job(
     id: u64,
     update: Arc<dyn Fn(u64, &mut dyn FnMut(&mut JobSnapshot)) + Send + Sync>,
 ) -> anyhow::Result<()> {
-    let start = std::time::Instant::now();
-    let last_emit = std::cell::Cell::new(0u128);
-    let make_progress = |update: Arc<
-        dyn Fn(u64, &mut dyn FnMut(&mut JobSnapshot)) + Send + Sync,
-    >| {
-        move |copied: u64, total: u64, pct: u8| {
-            let now = start.elapsed().as_millis();
-            if now - last_emit.get() > 200 || pct >= 100 {
-                last_emit.set(now);
-                let elapsed = now as f64 / 1000.0;
-                update(id, &mut move |s: &mut JobSnapshot| {
-                    s.total_bytes = total;
-                    s.copied_bytes = copied;
-                    s.percent = pct;
-                    s.speed_bps = if elapsed > 0.05 { copied as f64 / elapsed } else { 0.0 };
-                    s.eta_secs = if pct > 2 && elapsed > 0.2 {
-                        elapsed * (100.0 - pct as f64) / pct as f64
-                    } else {
-                        0.0
-                    };
-                });
-            }
-        }
-    };
     match job.kind {
-        JobKind::Push => {
-            // 冲突策略（push）：Skip 时过滤设备上已存在的同名文件；Overwrite 直传
-            let files = match job.policy {
-                ConflictPolicy::Skip => {
-                    let mut keep = Vec::new();
-                    for f in &job.files {
-                        let remote = format!(
-                            "{}/{}",
-                            job.remote.trim_end_matches('/'),
-                            f.file_name().unwrap_or_default().to_string_lossy()
-                        );
-                        let exists = adb
-                            .shell(
-                                &job.serial,
-                                &format!("[ -e '{}' ] && echo y || echo n", remote.replace('\'', "'\\''")),
-                            )
-                            .await
-                            .map(|s| s.trim() == "y")
-                            .unwrap_or(false);
-                        if !exists {
-                            keep.push(f.clone());
-                        }
-                    }
-                    if keep.is_empty() {
-                        anyhow::bail!("全部文件已存在（策略：跳过）");
-                    }
-                    keep
-                }
-                _ => job.files.clone(),
-            };
-            adb.push(
-                &job.serial,
-                &files,
-                &job.remote,
-                cancel,
-                make_progress(update.clone()),
-            )
-            .await?;
+        JobKind::Push => run_push(adb, job, cancel, id, update).await,
+        JobKind::Pull => run_pull(adb, job, cancel, id, update).await,
+    }
+}
+
+/// push 主流程：逐文件原子传输 + 冲突策略 + 失败重试 1 次。
+async fn run_push(
+    adb: &Adb,
+    job: &PendingJob,
+    cancel: CancelToken,
+    id: u64,
+    update: Arc<dyn Fn(u64, &mut dyn FnMut(&mut JobSnapshot)) + Send + Sync>,
+) -> anyhow::Result<()> {
+    let dir = job.remote.trim_end_matches('/').to_string();
+    let total: u64 = job
+        .files
+        .iter()
+        .filter_map(|f| std::fs::metadata(f).ok())
+        .map(|m| m.len())
+        .sum();
+    let start = std::time::Instant::now();
+    let last_emit = Arc::new(AtomicU64::new(0));
+    let n = job.files.len();
+    let mut done_bytes: u64 = 0;
+
+    for (idx, f) in job.files.iter().enumerate() {
+        if cancel.is_cancelled() {
+            anyhow::bail!("已取消");
         }
-        JobKind::Pull => {
-            // 目标文件名冲突处理（本地）：先拉到暂存目录，再按策略落位
-            let local_dir = &job.local_dir;
-            let name = job
-                .remote
-                .trim_end_matches('/')
-                .rsplit('/')
-                .next()
-                .unwrap_or(job.remote.as_str())
-                .to_string();
-            let target_name = match job.policy {
-                ConflictPolicy::Overwrite => name.clone(),
-                ConflictPolicy::Skip => {
-                    if local_dir.join(&name).exists() {
-                        anyhow::bail!("本地已存在 {}（策略：跳过）", name);
-                    }
-                    name.clone()
+        let fname = f
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| format!("file-{idx}"));
+        let rel = job
+            .rel_paths
+            .get(idx)
+            .cloned()
+            .unwrap_or_else(|| fname.clone());
+        let size = std::fs::metadata(f).map(|m| m.len()).unwrap_or(0);
+        update(id, &mut |s| {
+            s.title = format!("发送 {}/{}：{}", idx + 1, n, rel);
+        });
+
+        // 文件夹拖拽：先建子目录
+        if let Some(pos) = rel.rfind('/') {
+            let sub = format!("{dir}/{}", &rel[..pos]);
+            adb.shell(&job.serial, &format!("mkdir -p {}", shq(&sub))).await?;
+        }
+
+        // 冲突策略 -> 最终远端相对路径
+        let final_rel = match job.policy {
+            ConflictPolicy::Overwrite => rel.clone(),
+            ConflictPolicy::Skip => {
+                if remote_exists(adb, &job.serial, &format!("{dir}/{rel}")).await {
+                    done_bytes += size;
+                    emit_progress(&update, id, done_bytes, total, &start, &last_emit, true);
+                    continue;
                 }
-                ConflictPolicy::Rename => {
-                    let mut n = name.clone();
-                    let stem = std::path::Path::new(&name)
-                        .file_stem()
-                        .map(|s| s.to_string_lossy().into_owned())
-                        .unwrap_or_else(|| name.clone());
-                    let ext = std::path::Path::new(&name)
-                        .extension()
-                        .map(|s| format!(".{}", s.to_string_lossy()))
-                        .unwrap_or_default();
-                    let mut i = 1;
-                    while local_dir.join(&n).exists() {
-                        n = if ext.is_empty() {
-                            format!("{} ({})", stem, i)
-                        } else {
-                            format!("{} ({}).{}", stem, i, ext.trim_start_matches('.'))
-                        };
-                        i += 1;
-                    }
-                    n
-                }
-            };
-            let staging = local_dir.join(".screenlink_staging");
-            std::fs::create_dir_all(&staging)?;
-            adb.pull(
-                &job.serial,
-                &job.remote,
-                &staging,
-                cancel,
-                make_progress(update.clone()),
-            )
-            .await?;
-            let staged = staging.join(&name);
-            let final_path = local_dir.join(&target_name);
-            if staged.exists() {
-                if final_path.exists() {
-                    let _ = std::fs::remove_file(&final_path);
-                }
-                std::fs::rename(&staged, &final_path)?;
+                rel.clone()
             }
-            let _ = std::fs::remove_dir_all(&staging);
+            ConflictPolicy::Rename => {
+                let mut name = rel.clone();
+                let mut i = 1u32;
+                while remote_exists(adb, &job.serial, &format!("{dir}/{name}")).await {
+                    name = rename_candidate(&rel, i);
+                    i += 1;
+                }
+                name
+            }
+        };
+        let final_remote = format!("{dir}/{final_rel}");
+        // 临时名用原始文件名（不用 final_rel）：避免重命名后的 "(1)" 后缀混入 .part 名
+        let tmp_remote = format!("{dir}/.sl-part-{fname}");
+
+        // 单文件：失败自动重试 1 次（USB 抖动 / WiFi 瞬断）
+        let mut last_err: Option<anyhow::Error> = None;
+        for attempt in 0..2u8 {
+            if cancel.is_cancelled() {
+                anyhow::bail!("已取消");
+            }
+            let base = done_bytes;
+            let res = push_file_once(
+                adb,
+                &job.serial,
+                f,
+                &tmp_remote,
+                &final_remote,
+                cancel.clone(),
+                make_progress(
+                    update.clone(),
+                    last_emit.clone(),
+                    id,
+                    base,
+                    size,
+                    total,
+                    start,
+                ),
+            )
+            .await;
+            match res {
+                Ok(()) => {
+                    last_err = None;
+                    break;
+                }
+                Err(e) => {
+                    if cancel.is_cancelled() {
+                        anyhow::bail!("已取消");
+                    }
+                    last_err = Some(e);
+                    if attempt == 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                    }
+                }
+            }
         }
+        if let Some(e) = last_err {
+            return Err(e.context(format!("发送「{rel}」失败（其余文件已停止）")));
+        }
+        done_bytes += size;
+        emit_progress(&update, id, done_bytes, total, &start, &last_emit, true);
     }
     Ok(())
+}
+
+/// 单文件一次尝试：清残留 .part -> push 到临时名 -> 原子 mv 到最终名。
+async fn push_file_once(
+    adb: &Adb,
+    serial: &str,
+    file: &PathBuf,
+    tmp_remote: &str,
+    final_remote: &str,
+    cancel: CancelToken,
+    progress: impl FnMut(u64, u64, u8) + Send + 'static,
+) -> anyhow::Result<()> {
+    // 清上次中断的残留，保证 push 全量覆写
+    let _ = adb.shell(serial, &format!("rm -f {}", shq(tmp_remote))).await;
+    adb.push(serial, std::slice::from_ref(file), tmp_remote, cancel, progress)
+        .await?;
+    adb.shell(
+        serial,
+        &format!("mv -f {} {}", shq(tmp_remote), shq(final_remote)),
+    )
+    .await
+    .map(|_| ())
+    .map_err(|e| anyhow::Error::msg(format!("落盘失败: {e}")))
+}
+
+/// pull：本地冲突策略 + staging 暂存后落位（保持原实现）。
+async fn run_pull(
+    adb: &Adb,
+    job: &PendingJob,
+    cancel: CancelToken,
+    id: u64,
+    update: Arc<dyn Fn(u64, &mut dyn FnMut(&mut JobSnapshot)) + Send + Sync>,
+) -> anyhow::Result<()> {
+    let local_dir = &job.local_dir;
+    let name = job
+        .remote
+        .trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .unwrap_or(job.remote.as_str())
+        .to_string();
+    let target_name = match job.policy {
+        ConflictPolicy::Overwrite => name.clone(),
+        ConflictPolicy::Skip => {
+            if local_dir.join(&name).exists() {
+                anyhow::bail!("本地已存在 {}（策略：跳过）", name);
+            }
+            name.clone()
+        }
+        ConflictPolicy::Rename => {
+            let mut n = name.clone();
+            let stem = std::path::Path::new(&name)
+                .file_stem()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| name.clone());
+            let ext = std::path::Path::new(&name)
+                .extension()
+                .map(|s| format!(".{}", s.to_string_lossy()))
+                .unwrap_or_default();
+            let mut i = 1;
+            while local_dir.join(&n).exists() {
+                n = if ext.is_empty() {
+                    format!("{} ({})", stem, i)
+                } else {
+                    format!("{} ({}).{}", stem, i, ext.trim_start_matches('.'))
+                };
+                i += 1;
+            }
+            n
+        }
+    };
+    let start = std::time::Instant::now();
+    let last_emit = Arc::new(AtomicU64::new(0));
+    let staging = local_dir.join(".screenlink_staging");
+    std::fs::create_dir_all(&staging)?;
+    // 远端总量未知（0）：由 adb.pull 的 du 估算经回调补全
+    adb.pull(
+        &job.serial,
+        &job.remote,
+        &staging,
+        cancel,
+        make_progress(update, last_emit, id, 0, u64::MAX, 0, start),
+    )
+    .await?;
+    let staged = staging.join(&name);
+    let final_path = local_dir.join(&target_name);
+    if staged.exists() {
+        if final_path.exists() {
+            let _ = std::fs::remove_file(&final_path);
+        }
+        std::fs::rename(&staged, &final_path)?;
+    }
+    let _ = std::fs::remove_dir_all(&staging);
+    Ok(())
+}
+
+/// 节流的整体进度回调：abs = base + 本文件已传字节；
+/// total 为 0（未知，pull 场景）时回退用回调传入的 t，百分比回退用 adb 的 pct。
+#[allow(clippy::too_many_arguments)]
+fn make_progress(
+    update: Arc<dyn Fn(u64, &mut dyn FnMut(&mut JobSnapshot)) + Send + Sync>,
+    last_emit: Arc<AtomicU64>,
+    id: u64,
+    base: u64,
+    fsize: u64,
+    total: u64,
+    start: std::time::Instant,
+) -> impl FnMut(u64, u64, u8) + Send + 'static {
+    move |copied: u64, t: u64, pct: u8| {
+        let eff_total = if total > 0 { total } else { t };
+        let abs = base + copied.min(fsize);
+        let percent = if eff_total > 0 {
+            ((abs.min(eff_total) as f64 / eff_total as f64) * 100.0).min(100.0) as u8
+        } else {
+            pct.min(100)
+        };
+        let now = start.elapsed().as_millis() as u64;
+        if now.saturating_sub(last_emit.load(Ordering::Relaxed)) < 200 && percent < 100 {
+            return;
+        }
+        last_emit.store(now, Ordering::Relaxed);
+        let elapsed = start.elapsed().as_secs_f64();
+        update(id, &mut |s: &mut JobSnapshot| {
+            s.total_bytes = eff_total;
+            s.copied_bytes = abs;
+            s.percent = percent;
+            s.speed_bps = if elapsed > 0.05 { abs as f64 / elapsed } else { 0.0 };
+            s.eta_secs = if percent > 2 && elapsed > 0.2 {
+                elapsed * (100.0 - percent as f64) / percent as f64
+            } else {
+                0.0
+            };
+        });
+    }
+}
+
+fn emit_progress(
+    update: &Arc<dyn Fn(u64, &mut dyn FnMut(&mut JobSnapshot)) + Send + Sync>,
+    id: u64,
+    abs: u64,
+    total: u64,
+    start: &std::time::Instant,
+    last_emit: &AtomicU64,
+    force: bool,
+) {
+    let now = start.elapsed().as_millis() as u64;
+    if !force && now.saturating_sub(last_emit.load(Ordering::Relaxed)) < 200 {
+        return;
+    }
+    last_emit.store(now, Ordering::Relaxed);
+    emit_progress_at(update, id, abs, total, start);
+}
+
+fn emit_progress_at(
+    update: &Arc<dyn Fn(u64, &mut dyn FnMut(&mut JobSnapshot)) + Send + Sync>,
+    id: u64,
+    abs: u64,
+    total: u64,
+    start: &std::time::Instant,
+) {
+    let elapsed = start.elapsed().as_secs_f64();
+    let percent = if total > 0 {
+        (((abs.min(total)) as f64 / total as f64) * 100.0).min(100.0) as u8
+    } else {
+        0
+    };
+    update(id, &mut |s: &mut JobSnapshot| {
+        s.total_bytes = total;
+        s.copied_bytes = abs;
+        s.percent = percent;
+        s.speed_bps = if elapsed > 0.05 { abs as f64 / elapsed } else { 0.0 };
+        s.eta_secs = if percent > 2 && elapsed > 0.2 {
+            elapsed * (100.0 - percent as f64) / percent as f64
+        } else {
+            0.0
+        };
+    });
+}
+
+/// 远端文件是否存在（shell 单行探测）
+async fn remote_exists(adb: &Adb, serial: &str, path: &str) -> bool {
+    adb.shell(serial, &format!("[ -e {} ] && echo y || echo n", shq(path)))
+        .await
+        .map(|s| s.trim() == "y")
+        .unwrap_or(false)
+}
+
+/// shell 单引号转义
+fn shq(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "'\\''"))
+}
+
+/// Rename 策略的候选名：`a/b/c.mp4` + 1 -> `a/b/c (1).mp4`（保留子目录）
+fn rename_candidate(rel: &str, n: u32) -> String {
+    let (dir_part, file) = match rel.rfind('/') {
+        Some(pos) => (&rel[..pos + 1], &rel[pos + 1..]),
+        None => ("", rel),
+    };
+    let (stem, ext) = match file.rfind('.') {
+        Some(0) | None => (file, ""),
+        Some(pos) => (&file[..pos], &file[pos..]),
+    };
+    format!("{dir_part}{stem} ({n}){ext}")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rename_candidate_keeps_subdir_and_ext() {
+        assert_eq!(rename_candidate("a/b/c.mp4", 1), "a/b/c (1).mp4");
+        assert_eq!(rename_candidate("c.mp4", 2), "c (2).mp4");
+        assert_eq!(rename_candidate("noext", 1), "noext (1)");
+        assert_eq!(rename_candidate(".hidden", 1), ".hidden (1)"); // 点开头不是扩展名
+        assert_eq!(rename_candidate("d/archive.tar.gz", 3), "d/archive.tar (3).gz");
+    }
+
+    #[test]
+    fn shq_escapes_single_quotes() {
+        assert_eq!(shq("it's.txt"), "'it'\\''s.txt'");
+        assert_eq!(shq("中文 (1).mp4"), "'中文 (1).mp4'");
+    }
 }

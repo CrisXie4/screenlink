@@ -333,6 +333,47 @@ pub async fn device_clipboard(
 
 // ---------- 文件传输 ----------
 
+/// 展开拖拽路径：目录递归为文件清单 + 相对路径（保留结构），文件保持原名。
+/// 返回 (文件绝对路径列表, 对应远端相对路径)；上限 2000 个文件防误拖系统目录。
+fn expand_push_paths(paths: &[String]) -> Result<(Vec<std::path::PathBuf>, Vec<String>), Value> {
+    let mut files = Vec::new();
+    let mut rels = Vec::new();
+    fn walk(dir: &std::path::Path, prefix: &str, files: &mut Vec<std::path::PathBuf>, rels: &mut Vec<String>) {
+        let Ok(rd) = std::fs::read_dir(dir) else { return };
+        for e in rd.flatten() {
+            let name = e.file_name().to_string_lossy().into_owned();
+            let rel = format!("{prefix}/{name}");
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, &rel, files, rels);
+            } else if p.is_file() {
+                files.push(p);
+                rels.push(rel);
+            }
+        }
+    }
+    for raw in paths {
+        let p = std::path::PathBuf::from(raw);
+        let root = p
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "file".into());
+        if p.is_dir() {
+            walk(&p, &root, &mut files, &mut rels);
+        } else if p.is_file() {
+            files.push(p);
+            rels.push(root);
+        }
+        if files.len() > 2000 {
+            return Err(err("一次最多传输 2000 个文件"));
+        }
+    }
+    if files.is_empty() {
+        return Err(err("没有可传输的文件"));
+    }
+    Ok((files, rels))
+}
+
 #[tauri::command]
 pub async fn push_files(
     state: Ctx<'_>,
@@ -347,11 +388,12 @@ pub async fn push_files(
         Some("rename") => ConflictPolicy::Rename,
         _ => ConflictPolicy::Overwrite,
     };
-    let files: Vec<std::path::PathBuf> = paths.iter().map(std::path::PathBuf::from).collect();
+    let (files, rels) = expand_push_paths(&paths)?;
     let id = state.transfers.enqueue(
         JobKind::Push,
         &serial,
         files,
+        rels,
         &remote_dir,
         std::path::PathBuf::new(),
         policy,
@@ -382,11 +424,42 @@ pub async fn pull_file(
         JobKind::Pull,
         &serial,
         vec![],
+        vec![],
         &remote_path,
         dir,
         policy,
     );
     Ok(json!({ "jobId": id }))
+}
+
+/// 失败任务重试：以原参数重新入队。
+#[tauri::command]
+pub async fn retry_transfer(state: Ctx<'_>, id: u64) -> Result<Value, Value> {
+    state
+        .transfers
+        .retry(id)
+        .map(|nid| json!({ "jobId": nid }))
+        .ok_or_else(|| err("任务不存在或不可重试"))
+}
+
+// ---------- USB 驱动识别与修复（老电脑场景） ----------
+
+#[tauri::command]
+pub async fn usb_driver_status(_state: Ctx<'_>) -> Result<Value, Value> {
+    let st = tokio::task::spawn_blocking(screenlink_core::usb::status)
+        .await
+        .map_err(|e| err(e))?
+        .map_err(|e| err(e))?;
+    serde_json::to_value(st).map_err(|e| err(e))
+}
+
+/// 下载 Google USB Driver 并提权安装（触发 UAC，耗时约 10-30s）。
+#[tauri::command]
+pub async fn usb_driver_install(_state: Ctx<'_>) -> Result<Value, Value> {
+    let r = tokio::task::spawn_blocking(screenlink_core::usb::install_google_usb_driver)
+        .await
+        .map_err(|e| err(e))?;
+    r.map(|message| json!({ "message": message })).map_err(|e| err(e))
 }
 
 fn dirs_download() -> std::path::PathBuf {

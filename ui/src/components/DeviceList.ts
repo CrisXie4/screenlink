@@ -1,5 +1,5 @@
-// 左侧设备栏（240px，可折叠）：设备列表 + 选中高亮 + 无线连接操作
-import { api, displayName, type DeviceInfo, type DiscoveryResult } from "../tauri";
+// 左侧设备栏（240px，可折叠）：设备列表 + 选中高亮 + 无线连接操作 + USB 驱动修复
+import { api, displayName, type DeviceInfo, type DiscoveryResult, type UsbStatus } from "../tauri";
 import { el, selectedDevice, store, toast } from "../store";
 import { iconEl } from "../icons";
 
@@ -12,6 +12,60 @@ export function createDeviceBar(h: DeviceListHandlers) {
   const list = el("div", { class: "scroll" });
   const lanBox = el("div", {});
   const bar = el("div", { class: "devicebar" });
+
+  // ---- USB 驱动状态（老电脑：ADB 接口缺驱动时 adb 完全看不到设备） ----
+  let usbStatus: UsbStatus | null = null;
+  let usbCheckedAt = 0;
+  let usbInstalling = false;
+
+  async function refreshUsbStatus() {
+    const now = Date.now();
+    if (now - usbCheckedAt < 5000) return;
+    usbCheckedAt = now;
+    try {
+      usbStatus = await api.usbDriverStatus();
+    } catch {
+      return; // 非 Windows 或枚举失败：静默
+    }
+    render();
+  }
+
+  async function installDriver() {
+    if (usbInstalling) return;
+    usbInstalling = true;
+    render();
+    try {
+      const r = await api.usbDriverInstall();
+      toast("USB 驱动已安装", r?.message ?? "重新插拔数据线后即可识别");
+      usbCheckedAt = 0;
+      await api.listDevices();
+    } catch (e) {
+      toast("驱动安装失败", String(e).replace("error: ", ""), true);
+    } finally {
+      usbInstalling = false;
+      render();
+    }
+  }
+
+  function usbHint(): HTMLElement | null {
+    const hasOnlineUsb = store.devices.some((d) => d.state === "online" && d.transport === "usb");
+    if (!usbStatus?.missing_driver || hasOnlineUsb) return null;
+    const names = usbStatus.devices
+      .filter((d) => d.status !== "OK")
+      .map((d) => d.name)
+      .slice(0, 2)
+      .join("、") || "Android 设备";
+    return el("div", { class: "guide", style: "color:var(--warn,#b45309)" },
+      iconEl("cable", 12), ` 检测到「${names}」的 USB 驱动异常`, el("br"),
+      el("span", { style: "color:var(--text-3)" }, "老系统常见问题，安装 Google USB 驱动可修复（需管理员确认）"),
+      el("br"),
+      el("button", {
+        class: "primary small",
+        style: "margin-top:6px",
+        disabled: usbInstalling,
+        onclick: () => void installDriver(),
+      }, usbInstalling ? "正在下载并安装…" : "一键安装驱动"));
+  }
 
   // ---- 渲染 ----
   function render() {
@@ -29,7 +83,10 @@ export function createDeviceBar(h: DeviceListHandlers) {
           "2. 或使用右侧「无线连接」"),
       );
     }
+    const hint = usbHint();
+    if (hint) list.append(hint);
     for (const d of [...online, ...others]) list.append(card(d, sel === d.serial));
+    void refreshUsbStatus();
 
     // 无线发现结果
     lanBox.innerHTML = "";

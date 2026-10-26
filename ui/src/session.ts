@@ -65,6 +65,18 @@ export class MirrorSession {
     this.disconnect();
     this.intentionalClose = false;
     this.serial = serial;
+    // 老电脑兼容：WebView2 运行时过旧（<Edge 94）没有 WebCodecs，
+    // 不检测会表现为"连接中"卡死后无提示，这里直接给出修复路径
+    if (typeof VideoDecoder === "undefined" || typeof EncodedVideoChunk === "undefined") {
+      this.serial = null;
+      this.cb.onStep("");
+      this.cb.onClosed(
+        "此电脑的 WebView2 运行时不支持视频解码（WebCodecs）。" +
+        "请安装最新版 Microsoft Edge WebView2 Runtime（https://developer.microsoft.com/microsoft-edge/webview2/）后重启应用；" +
+        "低配老电脑建议 Windows 10 1803+ 并完成系统更新。",
+      );
+      return;
+    }
     this.cb.onStep("正在启动服务…");
     try {
       const res = await api.startMirror(serial);

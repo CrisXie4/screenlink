@@ -125,6 +125,11 @@ screenlink-cli page --serial <S>                     # uiautomator 页面结构
 
 调试环境变量：`SCREENLINK_DEBUG=1` 输出 Scrcpy 握手逐步骤日志；`SCREENLINK_ADB` 指定 adb 路径；`SCREENLINK_SERVER_JAR` 指定 server jar。
 
+## 专题指南
+
+- [无线连接指南](docs/wireless.md)：两种无线模式、配对流程、息屏断连/mDNS 残留等真机踩坑与排查决策树
+- [低端手机 / 老电脑适配](docs/low-end.md)：画质预设与参数取舍、WebCodecs 要求、USB 驱动一键修复、MIUI/HyperOS 后台冻结对策
+
 ## 已知限制 / 路线图
 
 - 音频转发（Scrcpy Opus 通道协议已预留，UI 未接入）

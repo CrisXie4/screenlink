@@ -51,10 +51,24 @@ export interface Settings {
   max_size: number;
   bit_rate: number;
   max_fps: number;
+  keyframe_interval: number;
   push_dir: string;
   pull_dir: string;
   clipboard_sync: boolean;
   auto_switch_wifi: boolean;
+}
+
+export interface UsbDeviceStatus {
+  name: string;
+  instance_id: string;
+  vid: string;
+  status: string;
+  problem: number;
+}
+
+export interface UsbStatus {
+  devices: UsbDeviceStatus[];
+  missing_driver: boolean;
 }
 
 export interface AuditEntry {
@@ -95,6 +109,9 @@ export const api = {
     call<{ jobId: number }>("pull_file", { serial, remotePath, localDir, policy: policy ?? null }),
   listTransfers: () => call<JobSnapshot[]>("list_transfers"),
   cancelTransfer: (id: number) => call("cancel_transfer", { id }),
+  retryTransfer: (id: number) => call<{ jobId: number }>("retry_transfer", { id }),
+  usbDriverStatus: () => call<UsbStatus>("usb_driver_status"),
+  usbDriverInstall: () => call<{ message?: string }>("usb_driver_install"),
   uploadFrame: (serial: string, mime: string, dataB64: string) =>
     call("upload_frame", { serial, mime, dataB64 }),
   getSettings: () => call<{ settings: Settings; aiEnabled: boolean; wsPort: number }>("get_settings"),

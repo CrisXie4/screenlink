@@ -249,6 +249,9 @@ pub struct ServerOptions {
     pub audio: bool,
     pub stay_awake: bool,
     pub show_touches: bool,
+    /// 关键帧间隔（秒）：默认 1 保证中途接入秒级恢复；
+    /// 低配设备放宽（如 4）可显著降低编码端码率峰值与解码端压力
+    pub keyframe_interval: i32,
 }
 
 impl Default for ServerOptions {
@@ -261,6 +264,7 @@ impl Default for ServerOptions {
             audio: false,
             stay_awake: true,
             show_touches: false,
+            keyframe_interval: 1,
         }
     }
 }
@@ -289,8 +293,8 @@ impl ServerOptions {
             "send_dummy_byte=true".into(),
             "send_codec_meta=true".into(),
             "downsize_on_error=true".into(),
-            // 每秒一个关键帧：渲染端中途接入可快速恢复画面
-            "video_codec_options=i-frame-interval=1".into(),
+            // 关键帧间隔可调：默认每秒一帧保证渲染端快速接入
+            format!("video_codec_options=i-frame-interval={}", self.keyframe_interval.max(1)),
         ];
         args
     }

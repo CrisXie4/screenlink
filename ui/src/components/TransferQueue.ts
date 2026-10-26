@@ -62,6 +62,14 @@ export class TransferQueue {
             onclick: () => void api.cancelTransfer(j.id).catch((e) => toast("取消失败", String(e), true)),
           }, "取消")
           : null,
+        j.state === "failed"
+          ? el("button", {
+            class: "ghost small",
+            onclick: () => {
+              void api.retryTransfer(j.id).catch((e) => toast("重试失败", String(e), true));
+            },
+          }, "重试")
+          : null,
       ),
       el("div", { class: "bar2" }, el("div", { style: `width:${j.percent}%` })),
       j.error ? el("div", { class: "errmsg" }, j.error) : null,

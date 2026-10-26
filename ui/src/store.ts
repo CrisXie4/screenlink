@@ -21,6 +21,7 @@ export const store: Store = {
     max_size: 1600,
     bit_rate: 12_000_000,
     max_fps: 60,
+    keyframe_interval: 1,
     push_dir: "/sdcard/Download/ScreenLink",
     pull_dir: "",
     clipboard_sync: true,

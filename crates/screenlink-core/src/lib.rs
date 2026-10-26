@@ -7,6 +7,7 @@ pub mod discovery;
 pub mod ipc;
 pub mod scrcpy;
 pub mod transfer;
+pub mod usb;
 pub mod util;
 pub mod ws;
 

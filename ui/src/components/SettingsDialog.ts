@@ -13,6 +13,35 @@ export function openSettingsDialog(onChanged: () => void) {
   const bitrate = el("input", { type: "range", min: "2000000", max: "50000000", step: "1000000", value: String(s.bit_rate) }) as HTMLInputElement;
   const bitrateLabel = el("span", { style: "font-size:12px;color:var(--text-2);width:64px" }, `${(s.bit_rate / 1e6).toFixed(0)} Mbps`);
   bitrate.addEventListener("input", () => { bitrateLabel.textContent = `${(Number(bitrate.value) / 1e6).toFixed(0)} Mbps`; });
+  const fpsSel = el("select", {},
+    ...[15, 24, 30, 60, 120].map((v) =>
+      el("option", { value: String(v), ...(v === s.max_fps ? { selected: "true" } : {}) }, `${v} fps`))) as HTMLSelectElement;
+  const kfSel = el("select", {},
+    ...[1, 2, 4, 10].map((v) =>
+      el("option", { value: String(v), ...(v === s.keyframe_interval ? { selected: "true" } : {}) },
+        v === 1 ? "1 秒（接入最快）" : `${v} 秒（更省电省带宽）`))) as HTMLSelectElement;
+
+  // 画质预设：老电脑/低端机选「流畅」；点击填充下方参数，保存后下次投屏生效
+  const PRESETS = [
+    { name: "流畅", size: "1280", rate: "4000000", fps: "30", kf: "4", hint: "老电脑 / 低端手机" },
+    { name: "均衡", size: "1600", rate: "8000000", fps: "60", kf: "2", hint: "推荐" },
+    { name: "高清", size: "1920", rate: "16000000", fps: "60", kf: "1", hint: "高配设备" },
+  ];
+  const presetRow = el("div", { class: "field" },
+    el("div", {}, el("div", {}, "画质预设"),
+      el("div", { class: "hint" }, "点击填充参数，保存后下次投屏生效")),
+    el("div", { style: "display:flex;gap:6px" },
+      ...PRESETS.map((p) => el("button", {
+        class: "small",
+        title: p.hint,
+        onclick: () => {
+          sizeSel.value = p.size;
+          bitrate.value = p.rate;
+          bitrateLabel.textContent = `${(Number(p.rate) / 1e6).toFixed(0)} Mbps`;
+          fpsSel.value = p.fps;
+          kfSel.value = p.kf;
+        },
+      }, p.name))));
 
   const pushDir = el("input", { type: "text", value: s.push_dir }) as HTMLInputElement;
   const pullDir = el("input", { type: "text", value: s.pull_dir, placeholder: "默认下载目录" }) as HTMLInputElement;
@@ -26,6 +55,8 @@ export function openSettingsDialog(onChanged: () => void) {
         ...s,
         max_size: Number(sizeSel.value),
         bit_rate: Number(bitrate.value),
+        max_fps: Number(fpsSel.value),
+        keyframe_interval: Number(kfSel.value),
         push_dir: pushDir.value.trim() || "/sdcard/Download/ScreenLink",
         pull_dir: pullDir.value.trim(),
         clipboard_sync: clipSwitch.checked,
@@ -54,8 +85,11 @@ export function openSettingsDialog(onChanged: () => void) {
     ),
     el("div", { class: "card" },
       el("h3", {}, "投屏与传输"),
+      presetRow,
       field("分辨率上限", sizeSel),
       field("视频码率", el("span", { style: "display:flex;align-items:center;gap:8px" }, bitrate, bitrateLabel)),
+      field("帧率上限", fpsSel, "低配设备建议 30 fps"),
+      field("关键帧间隔", kfSel, "间隔越大越省电省带宽，重新接入恢复画面越慢"),
       field("推送目录（手机）", pushDir),
       field("接收目录（电脑）", pullDir),
       field("剪贴板双向同步", clipSwitch, "电脑与手机复制粘贴自动同步"),
