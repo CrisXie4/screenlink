@@ -224,7 +224,9 @@ impl TransferManager {
             f(&mut s);
             snaps.push(s);
         }
-        let _ = self.snapshots_tx.send(snaps);
+        // send_replace 而非 send：send 在没有任何 receiver 时会丢弃值不存储
+        // （GUI 常驻订阅者掩盖过该问题），独立使用本管理器时快照也必须可读
+        self.snapshots_tx.send_replace(snaps);
     }
 
     fn spawn_worker(&self, mut rx: mpsc::UnboundedReceiver<PendingJob>) {
@@ -258,7 +260,7 @@ impl TransferManager {
                             let mut list = snaps_tx.borrow().clone();
                             if let Some(s) = list.iter_mut().find(|s| s.id == id) {
                                 f(s);
-                                let _ = snaps_tx.send(list);
+                                snaps_tx.send_replace(list);
                             }
                         };
                         let update: Arc<
