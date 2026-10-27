@@ -42,10 +42,13 @@ class AgentShell(private val context: Context) {
         storageDir: String = "/sdcard/Download/ScreenLink",
         port: Int = 27188,
     ): Boolean = withContext(Dispatchers.IO) {
-        runCatching { ShellRunner.run("pkill -f AgentMain", timeoutMs = 5_000L) }
-        // setsid 换新会话 + 保引用防 GC destroy：两重保险防后台进程被连带杀掉
+        // [A] 方括号防 pkill 把含 "AgentMain" 字样的当前 shell 命令自身也杀掉
+        runCatching { ShellRunner.run("pkill -f '[A]gentMain'", timeoutMs = 5_000L) }
+        // setsid 换新会话 + 保引用防 GC destroy：两重保险防后台进程被连带杀掉。
+        // Kotlin 顶层 fun main 的 JVM 类名是 AgentMainKt（AgentMain 只是文件名），
+        // app_process 入口必须写 AgentMainKt，写 AgentMain 会 ClassNotFoundException。
         val script = "setsid sh -c 'CLASSPATH=$remoteApk app_process / " +
-            "dev.screenlink.companion.agent.AgentMain $port \"$storageDir\" $tokenSha256Hex " +
+            "dev.screenlink.companion.agent.AgentMainKt $port \"$storageDir\" $tokenSha256Hex " +
             ">/data/local/tmp/sl-agent.log 2>&1' &"
         val proc = ShellRunner.newShellProcess(script)
         keepProc = proc // 持有引用：IRemoteProcess 被 GC 终结时会 destroy 远端进程组
@@ -59,7 +62,7 @@ class AgentShell(private val context: Context) {
     suspend fun stop(): Boolean = withContext(Dispatchers.IO) {
         runCatching { keepProc?.destroy() }
         keepProc = null
-        ShellRunner.run("pkill -f AgentMain", timeoutMs = 5_000L)
+        ShellRunner.run("pkill -f '[A]gentMain'", timeoutMs = 5_000L)
         repeat(10) {
             if (!isAlive()) return@withContext true
             kotlinx.coroutines.delay(200)

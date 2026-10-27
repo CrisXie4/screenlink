@@ -386,17 +386,27 @@ fun SettingsPanel(vm: MainViewModel) {
                         onClick = {
                             scope.launch {
                                 shellBusy = true
-                                val shell = AgentShell(context)
-                                runCatching { shell.install() }
                                 val shas = PairingStore(context).allTokenShas()
-                                val ok = if (shas.isEmpty()) false else shell.start(shas.joinToString(","))
-                                if (!ok) {
+                                if (shas.isEmpty()) {
                                     android.widget.Toast.makeText(
-                                        context, "启动失败（见 logcat / agent 日志）", android.widget.Toast.LENGTH_LONG,
+                                        context,
+                                        "还没有与电脑配对：先回到主页完成配对，再启动 Shell 直连",
+                                        android.widget.Toast.LENGTH_LONG,
                                     ).show()
+                                } else {
+                                    // 先停内置 server 释放 27188（shell agent 无法抢占活跃监听）
+                                    vm.stopAgent()
+                                    val shell = AgentShell(context)
+                                    runCatching { shell.install() }
+                                    val ok = shell.start(shas.joinToString(","))
+                                    if (!ok) {
+                                        android.widget.Toast.makeText(
+                                            context, "启动失败（见 logcat / agent 日志）", android.widget.Toast.LENGTH_LONG,
+                                        ).show()
+                                    }
+                                    AgentModePrefs.set(context, ok)
                                 }
                                 shellBusy = false
-                                AgentModePrefs.set(context, ok)
                             }
                         },
                     ) { Text(text = "启动") }
@@ -407,6 +417,8 @@ fun SettingsPanel(vm: MainViewModel) {
                                 shellBusy = true
                                 AgentShell(context).stop()
                                 AgentModePrefs.set(context, false)
+                                // 内置 server 接回 27188（恢复 App 内服务与通知）
+                                vm.startAgent()
                                 shellBusy = false
                             }
                         },

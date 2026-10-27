@@ -8,3 +8,4 @@ assets/*.jar.tmp
 
 # Tauri 自动生成
 crates/screenlink-app/gen/
+tmp/
