@@ -32,6 +32,9 @@ pub struct DeviceInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub wifi_ip: Option<String>,
     pub mirroring: bool,
+    /// 检测到伴侣 App（UDP 发现命中该设备的 WiFi IP）
+    #[serde(default)]
+    pub has_app: bool,
 }
 
 impl DeviceInfo {
@@ -104,6 +107,7 @@ pub fn parse_devices_line(line: &str) -> Option<DeviceInfo> {
         battery: None,
         wifi_ip: None,
         mirroring: false,
+        has_app: false,
     })
 }
 

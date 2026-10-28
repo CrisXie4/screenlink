@@ -134,12 +134,20 @@ object AgentServer {
         _state.value = AgentState.Listening(localIpv4(), Protocol.PORT)
         sc.launch { acceptLoop(socket) }
         registerNsd(app, s)
+        // UDP 广播发现应答（PC 端扫描用；serial 用 ANDROID_ID 去重）
+        val serial = android.provider.Settings.Secure.getString(
+            app.contentResolver, android.provider.Settings.Secure.ANDROID_ID,
+        ) ?: ""
+        dev.screenlink.companion.core.DiscoveryResponder.start(
+            name = Build.MODEL, serial = serial, agentPort = Protocol.PORT,
+        )
     }
 
     fun stop(context: Context) {
         if (!running) return
         running = false
         unregisterNsd()
+        dev.screenlink.companion.core.DiscoveryResponder.stop()
         PairingCoordinator.invalidate()
 
         // 对端礼貌收尾：BYE{reason:shutdown}（§5.6，发送前缓冲已逐帧 flush）

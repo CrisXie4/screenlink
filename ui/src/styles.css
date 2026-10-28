@@ -142,6 +142,7 @@ button.icon-only { padding: 5px 7px; }
 .chip.usb { color: var(--primary); border-color: #c9ddf9; background: var(--primary-soft); }
 .chip.wifi { color: #0e7490; border-color: #cdeef5; background: #ecfbfe; }
 .chip.off { color: var(--danger); border-color: #f6d5d5; background: var(--danger-soft); }
+.chip.app { color: #6d28d9; border-color: #e3d9fb; background: #f3eefe; }
 
 /* ---------- 主体 ---------- */
 .body { flex: 1; display: flex; min-height: 0; }

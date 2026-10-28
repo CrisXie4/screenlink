@@ -91,6 +91,27 @@ export function createDeviceBar(h: DeviceListHandlers) {
     // 无线发现结果
     lanBox.innerHTML = "";
     if (lanResults) {
+      // 伴侣 App 信标（UDP 广播发现，无需 adb）：标记 + 配对/连接入口
+      const paired = pairedPhones;
+      for (const u of lanResults.udp) {
+        const isPaired = paired.some((p) => p.ip.includes(u.ip));
+        lanBox.append(lanItem(
+          "App",
+          u.name || "伴侣App 设备",
+          `${u.ip}:${u.port}`,
+          isPaired
+            ? async () => {
+                try {
+                  const r = await api.phoneConnect(u.ip);
+                  toast("已连接", `${r.name}（伴侣 App 链路就绪）`);
+                } catch (e) {
+                  toast("连接失败", String(e), true);
+                }
+              }
+            : () => appPairModal(u.ip),
+          isPaired ? "连接" : "配对",
+        ));
+      }
       for (const svc of lanResults.mdns) {
         lanBox.append(lanItem(
           svc.kind === "pairing" ? "待配对" : "可连接",
@@ -141,9 +162,12 @@ export function createDeviceBar(h: DeviceListHandlers) {
     },
       el("div", { class: "row1" },
         el("span", { class: "nm" }, displayName(d)),
-        el("span", { class: `chip ${d.transport === "wifi" ? "wifi" : d.transport === "usb" ? "usb" : ""}` },
-          iconEl(d.transport === "wifi" ? "wifi" : "cable", 11),
-          document.createTextNode(d.transport === "wifi" ? "WiFi" : d.transport === "usb" ? "USB" : "模拟器"),
+        el("span", { style: "display:flex;gap:4px" },
+          d.has_app ? el("span", { class: "chip app" }, "App") : null,
+          el("span", { class: `chip ${d.transport === "wifi" ? "wifi" : d.transport === "usb" ? "usb" : ""}` },
+            iconEl(d.transport === "wifi" ? "wifi" : "cable", 11),
+            document.createTextNode(d.transport === "wifi" ? "WiFi" : d.transport === "usb" ? "USB" : "模拟器"),
+          ),
         ),
       ),
       el("div", { class: "meta" },
@@ -157,8 +181,9 @@ export function createDeviceBar(h: DeviceListHandlers) {
 
   function lanItem(kind: string, name: string, addr: string, onGo: () => void, goLabel: string): HTMLElement {
     const btn = el("button", { class: "primary small", onclick: onGo }, goLabel);
+    const chipClass = kind === "待配对" ? "off" : kind === "App" ? "app" : "wifi";
     return el("div", { class: "lan-item" },
-      el("span", { class: `chip ${kind === "待配对" ? "off" : "wifi"}` }, kind),
+      el("span", { class: `chip ${chipClass}` }, kind),
       el("span", { class: "nm" }, name),
       el("span", { class: "addr" }, addr),
       btn,
@@ -167,12 +192,104 @@ export function createDeviceBar(h: DeviceListHandlers) {
 
   // ---- 无线操作 ----
   let lanResults: DiscoveryResult | null = null;
+  let pairedPhones: { tokenId: string; name: string; ip: string }[] = [];
   const scanHint = el("div", { class: "lan-item", style: "display:none;color:var(--text-3)" }, "扫描中…");
+
+  async function refreshPaired() {
+    try {
+      pairedPhones = (await api.phonePaired()).phones;
+    } catch {
+      pairedPhones = [];
+    }
+  }
+
+  /// 伴侣 App 配对弹窗（两步）：获取配对码（手机端显示）→ 在此输入并提交。
+  function appPairModal(presetIp = "") {
+    const ipInput = el("input", { type: "text", placeholder: "手机 IP（端口自动 27188）", value: presetIp }) as HTMLInputElement;
+    const codeInput = el("input", { type: "text", placeholder: "6 位配对码", style: "display:none" }) as HTMLInputElement;
+    const stepHint = el("div", { class: "desc" },
+      "确保手机上的 ScreenLink 伴侣 App 服务已开启，且与电脑同一局域网");
+    const errBox = el("div", { class: "error" });
+    let phase: "idle" | "waiting" = "idle";
+
+    const getCodeBtn = el("button", {
+      class: "primary",
+      onclick: async () => {
+        errBox.textContent = "";
+        const ip = ipInput.value.trim();
+        if (!ip) { errBox.textContent = "请输入手机 IP"; return; }
+        getCodeBtn.disabled = true;
+        getCodeBtn.textContent = "连接中…";
+        try {
+          await api.phonePairBegin(ip);
+          phase = "waiting";
+          stepHint.textContent = "手机上已显示 6 位配对码（App 通知栏 / 状态页），请在下方输入（5 分钟内有效）";
+          codeInput.style.display = "";
+          codeInput.focus();
+          getCodeBtn.style.display = "none";
+          submitBtn.style.display = "";
+          cancelBtn.textContent = "取消配对";
+        } catch (e) {
+          errBox.textContent = String(e).replace("error: ", "");
+          getCodeBtn.disabled = false;
+          getCodeBtn.textContent = "获取配对码";
+        }
+      },
+    }, "获取配对码");
+    const submitBtn = el("button", {
+      class: "primary",
+      style: "display:none",
+      onclick: async () => {
+        errBox.textContent = "";
+        const code = codeInput.value.trim();
+        if (code.length !== 6) { errBox.textContent = "请输入 6 位配对码"; return; }
+        submitBtn.disabled = true;
+        try {
+          const r = await api.phonePairSubmit(code);
+          mask.remove();
+          toast("配对成功", `${r.name} 已信任此电脑`);
+          await refreshPaired();
+          await api.listDevices();
+        } catch (e) {
+          errBox.textContent = String(e).replace("error: ", "");
+          submitBtn.disabled = false;
+        }
+      },
+    }, "配对");
+    const cancelBtn = el("button", {
+      onclick: () => {
+        void api.phonePairCancel().catch(() => {});
+        mask.remove();
+      },
+    }, "取消");
+
+    const mask = el("div", { class: "modal-mask" }, el("div", { class: "modal" },
+      el("h3", {}, "配对伴侣 App"),
+      el("div", { class: "field" },
+        el("div", {}, el("div", {}, "手机 IP"),
+          el("div", { class: "hint" }, "手机与电脑同一局域网；可在上方扫描结果的 App 条目中查看 IP")),
+        ipInput,
+      ),
+      stepHint,
+      codeInput,
+      errBox,
+      el("div", { class: "btns" },
+        cancelBtn,
+        getCodeBtn,
+        submitBtn,
+      ),
+    ));
+    mask.addEventListener("click", (e) => e.target === mask && (void api.phonePairCancel().catch(() => {}), mask.remove()));
+    document.body.append(mask);
+    ipInput.focus();
+    void phase;
+  }
 
   async function scan() {
     scanHint.style.display = "block";
     try {
       lanResults = await api.scanLan();
+      await refreshPaired();
       render();
     } catch (e) {
       toast("扫描失败", String(e), true);

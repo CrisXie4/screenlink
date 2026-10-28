@@ -35,6 +35,9 @@ fun main(args: Array<String>) {
         return
     }).split(',').map { it.trim().lowercase() }
     File(storageDir, "outbox").mkdirs()
+    dev.screenlink.companion.core.DiscoveryResponder.start(
+        name = android.os.Build.MODEL, serial = "", agentPort = port,
+    )
     System.err.println("[sl-agent] listening :$port storage=$storageDir")
 
     val server = ServerSocket()

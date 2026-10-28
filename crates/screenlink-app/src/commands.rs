@@ -18,7 +18,8 @@ fn err(e: impl std::fmt::Display) -> Value {
 
 #[tauri::command]
 pub async fn list_devices(app: AppHandle, state: Ctx<'_>) -> Result<Value, Value> {
-    let devices = enrich(&state.adb).await.unwrap_or_default();
+    let beacons = state.phone_beacons.lock().unwrap().clone();
+    let devices = enrich(&state.adb, &beacons).await.unwrap_or_default();
     let mirroring: Vec<String> = state
         .sessions
         .lock()
@@ -31,7 +32,11 @@ pub async fn list_devices(app: AppHandle, state: Ctx<'_>) -> Result<Value, Value
 }
 
 /// 设备列表 + 属性富化（型号/安卓版本/电量/wifi ip），失败字段留空。
-pub async fn enrich(adb: &screenlink_core::adb::Adb) -> anyhow::Result<Vec<screenlink_core::device::DeviceInfo>> {
+/// beacons：伴侣 App UDP 信标（ip -> ip），wifi 设备命中即打 has_app 标记。
+pub async fn enrich(
+    adb: &screenlink_core::adb::Adb,
+    beacons: &std::collections::HashMap<String, String>,
+) -> anyhow::Result<Vec<screenlink_core::device::DeviceInfo>> {
     let mut devices = adb.devices().await?;
     let mut jobs = Vec::new();
     for d in devices.clone() {
@@ -73,6 +78,11 @@ pub async fn enrich(adb: &screenlink_core::adb::Adb) -> anyhow::Result<Vec<scree
                 d.sdk = sdk;
                 d.battery = battery;
                 d.wifi_ip = wifi_ip;
+                if let Some(wip) = &d.wifi_ip {
+                    if beacons.values().any(|b| b == wip) {
+                        d.has_app = true;
+                    }
+                }
             }
         }
     }
@@ -127,7 +137,89 @@ pub async fn enable_tcpip(app: AppHandle, state: Ctx<'_>, serial: String) -> Res
 #[tauri::command]
 pub async fn scan_lan(state: Ctx<'_>) -> Result<Value, Value> {
     let r = screenlink_core::discovery::Discovery::scan(&state.adb).await;
+    // 缓存伴侣 App 信标（enrich 打 has_app 标记 + 无线列表渲染）
+    if let Ok(mut beacons) = state.phone_beacons.lock() {
+        beacons.clear();
+        for u in &r.udp {
+            let key = if u.serial.is_empty() { format!("ip:{}", u.ip) } else { u.serial.clone() };
+            beacons.insert(key, u.ip.clone());
+        }
+    }
     Ok(serde_json::to_value(&r).unwrap_or(json!({})))
+}
+
+// ---------- 伴侣 App：发现标记 / 配对 / 连接 ----------
+
+/// UDP 发现的伴侣 App 信标（PC 广播探测，无需 adb）。
+#[tauri::command]
+pub async fn phone_beacons(state: Ctx<'_>) -> Result<Value, Value> {
+    let list: Vec<Value> = state
+        .phone_beacons
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(k, ip)| json!({ "key": k, "ip": ip }))
+        .collect();
+    Ok(json!({ "beacons": list }))
+}
+
+/// 发起配对：连接手机 agent 并触发手机端显示配对码（同连接等待 submit）。
+#[tauri::command]
+pub async fn phone_pair_begin(state: Ctx<'_>, ip: String) -> Result<Value, Value> {
+    {
+        let mut s = state.pair_session.lock().unwrap();
+        if let Some(old) = s.take() {
+            old.cancel();
+        }
+    }
+    let session = screenlink_core::agent_client::pair_begin(&ip, 27188)
+        .await
+        .map_err(|e| err(e))?;
+    let mut s = state.pair_session.lock().unwrap();
+    *s = Some(session);
+    Ok(json!({ "ok": true }))
+}
+
+/// 提交配对码（必须与 begin 同连接；成功即持久化 token）。
+#[tauri::command]
+pub async fn phone_pair_submit(state: Ctx<'_>, code: String) -> Result<Value, Value> {
+    let session = { state.pair_session.lock().unwrap().take() };
+    let Some(session) = session else { return Err(err("没有进行中的配对会话")) };
+    let phone = session.submit_code(&code.trim()).await.map_err(|e| err(e))?;
+    Ok(json!({ "tokenId": phone.token_id, "name": phone.name, "ip": phone.ip }))
+}
+
+#[tauri::command]
+pub async fn phone_pair_cancel(state: Ctx<'_>) -> Result<(), Value> {
+    if let Some(s) = state.pair_session.lock().unwrap().take() {
+        s.cancel();
+    }
+    Ok(())
+}
+
+/// 已配对手机列表（不含 token 明文）。
+#[tauri::command]
+pub async fn phone_paired() -> Result<Value, Value> {
+    let list = screenlink_core::agent_client::load_paired();
+    Ok(json!({ "phones": list.iter().map(|p| json!({
+        "tokenId": p.token_id, "name": p.name, "ip": p.ip, "pairedAt": p.paired_at,
+    })).collect::<Vec<_>>() }))
+}
+
+/// 连接已配对手机：真 token 认证校验（传输通道另接）。
+#[tauri::command]
+pub async fn phone_connect(state: Ctx<'_>, ip: String) -> Result<Value, Value> {
+    let phones = screenlink_core::agent_client::load_paired();
+    let phone = phones
+        .iter()
+        .find(|p| p.ip.trim_start_matches("ip:").starts_with(&ip) || p.ip.contains(&ip))
+        .or_else(|| phones.first())
+        .ok_or_else(|| err("尚未配对任何手机"))?;
+    let name = screenlink_core::agent_client::verify(&ip, &phone.token)
+        .await
+        .map_err(|e| err(e))?;
+    let _ = &state;
+    Ok(json!({ "name": name, "tokenId": phone.token_id }))
 }
 
 // ---------- 投屏与反控 ----------
@@ -632,7 +724,8 @@ pub fn ipc_handler(state: Arc<AppState>, app: AppHandle) -> screenlink_core::ipc
                         return Ok(k.clone());
                     }
                 }
-                let devs = enrich(&state.adb).await.unwrap_or_default();
+                let beacons = state.phone_beacons.lock().unwrap().clone();
+                let devs = enrich(&state.adb, &beacons).await.unwrap_or_default();
                 devs.into_iter()
                     .find(|d| d.state == DeviceState::Online)
                     .map(|d| d.serial)
@@ -641,7 +734,8 @@ pub fn ipc_handler(state: Arc<AppState>, app: AppHandle) -> screenlink_core::ipc
             match method.as_str() {
                 "ping" => Ok(json!({ "pong": true })),
                 "devices" => {
-                    let devices = enrich(&state.adb)
+                    let beacons = state.phone_beacons.lock().unwrap().clone();
+                    let devices = enrich(&state.adb, &beacons)
                         .await
                         .map_err(|e| (-32005, e.to_string()))?;
                     let mirroring: Vec<String> =

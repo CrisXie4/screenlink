@@ -39,6 +39,12 @@ pub fn run() {
             commands::list_transfers,
             commands::cancel_transfer,
             commands::retry_transfer,
+            commands::phone_beacons,
+            commands::phone_pair_begin,
+            commands::phone_pair_submit,
+            commands::phone_pair_cancel,
+            commands::phone_paired,
+            commands::phone_connect,
             commands::usb_driver_status,
             commands::usb_driver_install,
             commands::upload_frame,
@@ -102,7 +108,8 @@ fn spawn_background(st: Arc<AppState>, handle: AppHandle) {
             tokio::spawn(async move {
                 let mut prev: Vec<String> = Vec::new();
                 loop {
-                    let devices = commands::enrich(&st2.adb).await.unwrap_or_default();
+                    let beacons = st2.phone_beacons.lock().unwrap().clone();
+                    let devices = commands::enrich(&st2.adb, &beacons).await.unwrap_or_default();
                     let online: Vec<String> = devices
                         .iter()
                         .filter(|d| d.state == screenlink_core::device::DeviceState::Online)
@@ -215,7 +222,8 @@ fn spawn_background(st: Arc<AppState>, handle: AppHandle) {
                 ev = app_rx.recv() => {
                     match ev {
                         Some(AppEvent::DevicesChanged) => {
-                            let devices = commands::enrich(&st.adb).await.unwrap_or_default();
+                            let beacons = st.phone_beacons.lock().unwrap().clone();
+let devices = commands::enrich(&st.adb, &beacons).await.unwrap_or_default();
                             let _ = handle.emit("devices", &devices);
                         }
                         Some(AppEvent::TransferSnapshots(v)) => {

@@ -11,6 +11,10 @@ object Protocol {
     /** 帧头 magic，固定 "SLNK"（0x53 0x4C 0x4E 0x4B） */
     const val MAGIC = "SLNK"
 
+    /** PC UDP 广播发现端口与探针（PROTOCOL.md §2；设备端 DiscoveryResponder 应答） */
+    const val UDP_DISCOVER_PORT = 27186
+    const val UDP_DISCOVER_MAGIC = "SCREENLINK_DISCOVER_V1"
+
     /** 协议版本（帧头 version 字节；与 mDNS TXT pv 同源，PROTOCOL.md §9） */
     const val VERSION = 1
 

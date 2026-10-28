@@ -88,6 +88,10 @@ pub struct AppState {
     /// 最后一次从设备同步来的剪贴板（供 MCP clipboard_get）
     pub last_device_clip: Mutex<HashMap<String, String>>,
     pub app_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<AppEvent>>>,
+    /// 进行中的伴侣 App 配对会话（单会话；begin→submit 同一 TCP 连接）
+    pub pair_session: Mutex<Option<screenlink_core::agent_client::PairingSession>>,
+    /// 最近一次扫描发现的伴侣 App 信标（serial|ip -> 回复），enrich 时给设备打 has_app 标记
+    pub phone_beacons: Mutex<HashMap<String, String>>,
 }
 
 #[derive(Debug, Clone)]
@@ -114,6 +118,8 @@ impl AppState {
             clip_tx,
             last_device_clip: Mutex::new(HashMap::new()),
             app_tx: Mutex::new(None),
+            pair_session: Mutex::new(None),
+            phone_beacons: Mutex::new(HashMap::new()),
         })
     }
 

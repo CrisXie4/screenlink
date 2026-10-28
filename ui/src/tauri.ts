@@ -12,6 +12,21 @@ export interface DeviceInfo {
   battery?: number | null;
   wifi_ip?: string | null;
   mirroring: boolean;
+  has_app?: boolean;
+}
+
+export interface UdpAgentReply {
+  name: string;
+  serial: string;
+  ip: string;
+  port: number;
+}
+
+export interface PairedPhone {
+  tokenId: string;
+  name: string;
+  ip: string;
+  pairedAt: number;
 }
 
 export function displayName(d: DeviceInfo): string {
@@ -92,6 +107,12 @@ export const api = {
   pairAddr: (addr: string, code: string) => call("pair_addr", { addr, code }),
   enableTcpip: (serial: string) => call<{ ip: string | null; addr: string | null }>("enable_tcpip", { serial }),
   scanLan: () => call<DiscoveryResult>("scan_lan"),
+  phonePairBegin: (ip: string) => call("phone_pair_begin", { ip }),
+  phonePairSubmit: (code: string) => call<{ tokenId: string; name: string; ip: string }>("phone_pair_submit", { code }),
+  phonePairCancel: () => call("phone_pair_cancel"),
+  phonePaired: () => call<{ phones: PairedPhone[] }>("phone_paired"),
+  phoneConnect: (ip: string) => call<{ name: string; tokenId: string }>("phone_connect", { ip }),
+  phoneBeacons: () => call<{ beacons: { key: string; ip: string }[] }>("phone_beacons"),
   startMirror: (serial: string) =>
     call<{ info: { width: number; height: number }; wsPort: number }>("start_mirror", { serial }),
   stopMirror: (serial: string) => call("stop_mirror", { serial }),
