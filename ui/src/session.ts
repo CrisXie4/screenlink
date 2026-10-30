@@ -31,6 +31,8 @@ export interface SessionCallbacks {
   onStats(stats: { fps: number; latencyMs: number; width: number; height: number }): void;
   /** 用户向画布拖入文件 */
   onDrop(paths: string[]): void;
+  /** 拖拽悬停状态变化（画布区域内拖入/离开），用于高亮 overlay；ScreenCanvas 内部自给 */
+  onDragActive?(active: boolean): void;
 }
 
 export class MirrorSession {
@@ -328,19 +330,37 @@ export class MirrorSession {
     void getCurrentWebview()
       .onDragDropEvent((ev) => {
         const p = ev.payload;
-        if (p.type === "drop") {
-          const rect = this.canvas.getBoundingClientRect();
-          const inside =
-            p.position.x >= rect.left &&
-            p.position.x <= rect.right &&
-            p.position.y >= rect.top &&
-            p.position.y <= rect.bottom;
-          if (this.serial && inside && p.paths.length) this.cb.onDrop(p.paths);
+        if (p.type === "enter" || p.type === "over") {
+          this.cb.onDragActive?.(this.hitTest(p.position));
+          return;
         }
+        // leave / drop：熄灭高亮
+        this.cb.onDragActive?.(false);
+        if (p.type !== "drop") return;
+        if (!p.paths.length || !this.hitTest(p.position)) return;
+        if (!this.serial) {
+          toast("请先连接设备", "拖拽发送需要先连接并开始投屏", true);
+          return;
+        }
+        this.cb.onDrop(p.paths);
       })
       .then((fn) => {
         this.unlistenDrag = fn;
       });
+  }
+
+  /** 命中测试：事件坐标是物理像素，必须除以 DPI 缩放后再与 CSS 矩形比较
+   *（125%/150% 缩放下直接比较会把画布右侧的 drop 判到区域外）。
+   * 画布隐藏（未投屏）时退化为整个画布区域，保证未连接的 drop 也有提示。 */
+  private hitTest(position: { x: number; y: number }): boolean {
+    const hidden = this.canvas.classList.contains("hidden");
+    const target = hidden ? (this.canvas.parentElement ?? this.canvas) : this.canvas;
+    const rect = target.getBoundingClientRect();
+    if (!rect.width && !rect.height) return false;
+    const scale = window.devicePixelRatio || 1;
+    const x = position.x / scale;
+    const y = position.y / scale;
+    return x >= rect.left && x <= rect.right && y >= rect.top && y <= rect.bottom;
   }
 
   async pushDropped(paths: string[]) {

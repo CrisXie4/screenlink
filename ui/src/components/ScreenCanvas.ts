@@ -20,6 +20,7 @@ export class ScreenCanvas {
         this.render();
         cb.onStreaming();
       },
+      onDragActive: (active) => this.overlay.classList.toggle("show", active),
     });
     this.area.append(this.canvas, this.statsEl, this.overlay);
     this.render();
