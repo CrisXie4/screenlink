@@ -46,6 +46,8 @@ AI (MCP stdio/HTTP) ──> screenlink-mcp ──> GUI IPC(:27190) 快速通道�
 
 依赖：Rust 1.85+（MSVC）、Node 18+、Android platform-tools（adb）、WebView2 运行时（Win10/11 自带）。
 
+> 手机端伴侣 App（Kotlin）在本仓库的 [`android-app`](https://github.com/CrisXie4/screenlink/tree/android-app) 分支（`android/` 工程），不在 main 上。
+
 ```powershell
 # 1. 前端
 cd ui && npm install && npm run build && cd ..
