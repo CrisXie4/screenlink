@@ -1,7 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<resources>
-    <!-- 骨架公共键（前缀 sl_）。实现者 A 的键写 strings_service.xml（sl_svc_）、
-         实现者 C 的键写 strings_ui.xml（sl_ui_），不得修改本文件（DESIGN.md §2/§3.5）。 -->
-    <string name="sl_app_name">ScreenLink 伴侣</string>
-    <string name="sl_share_send_to_pc">发送到电脑</string>
-</resources>
