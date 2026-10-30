@@ -226,9 +226,9 @@ pub async fn phone_connect(state: Ctx<'_>, ip: String) -> Result<Value, Value> {
 
 #[tauri::command]
 pub async fn start_mirror(app: AppHandle, state: Ctx<'_>, serial: String) -> Result<Value, Value> {
-    let info = state.start_mirror(&serial).await.map_err(|e| err(e))?;
+    let (info, audio_enabled) = state.start_mirror(&serial).await.map_err(|e| err(e))?;
     let _ = app.emit("mirror-started", json!({ "serial": serial, "info": info }));
-    Ok(json!({ "info": info, "wsPort": WS_PORT }))
+    Ok(json!({ "info": info, "wsPort": WS_PORT, "audioEnabled": audio_enabled }))
 }
 
 #[tauri::command]
@@ -466,6 +466,36 @@ fn expand_push_paths(paths: &[String]) -> Result<(Vec<std::path::PathBuf>, Vec<S
     Ok((files, rels))
 }
 
+/// 解析设备的 agent 直连目标：设备 wifi_ip ↔ 伴侣 App 信标 ↔ 配对记录三方匹配。
+/// 实例 id 绑定优先（PROTOCOL §8.2 防 token 收割）；旧记录（无 instance_id）
+/// 按 IP 匹配，首次成功后回填绑定。
+fn agent_target_for(state: &AppState, wifi_ip: &str) -> Option<screenlink_core::agent_link::AgentTarget> {
+    let beacons = state.phone_beacons.lock().unwrap().clone();
+    let paired = screenlink_core::agent_client::load_paired();
+    for (id, ip) in beacons.iter() {
+        if ip != wifi_ip {
+            continue;
+        }
+        for p in &paired {
+            let bound = p.instance_id.as_deref() == Some(id.as_str());
+            let legacy = p.instance_id.is_none()
+                && (p.ip == *ip || p.ip.split(':').next() == Some(ip.as_str()));
+            if bound || legacy {
+                if p.instance_id.is_none() {
+                    let mut np = p.clone();
+                    np.instance_id = Some(id.clone());
+                    screenlink_core::agent_client::upsert_paired(np);
+                }
+                return Some(screenlink_core::agent_link::AgentTarget {
+                    addr: format!("{ip}:27188"),
+                    token: p.token.clone(),
+                });
+            }
+        }
+    }
+    None
+}
+
 #[tauri::command]
 pub async fn push_files(
     state: Ctx<'_>,
@@ -481,6 +511,11 @@ pub async fn push_files(
         _ => ConflictPolicy::Overwrite,
     };
     let (files, rels) = expand_push_paths(&paths)?;
+    // agent 目标解析：需要设备 wifi_ip（查询失败不影响入队，仅走 adb）
+    let agent = match state.adb.wifi_ip(&serial).await {
+        Some(ip) => agent_target_for(&state, &ip),
+        None => None,
+    };
     let id = state.transfers.enqueue(
         JobKind::Push,
         &serial,
@@ -489,6 +524,7 @@ pub async fn push_files(
         &remote_dir,
         std::path::PathBuf::new(),
         policy,
+        agent,
     );
     Ok(json!({ "jobId": id }))
 }
@@ -520,6 +556,7 @@ pub async fn pull_file(
         &remote_path,
         dir,
         policy,
+        None,
     );
     Ok(json!({ "jobId": id }))
 }
@@ -558,6 +595,16 @@ fn dirs_download() -> std::path::PathBuf {
     #[cfg(windows)]
     {
         if let Some(home) = std::env::var_os("USERPROFILE") {
+            let p = std::path::PathBuf::from(home).join("Downloads");
+            if p.is_dir() {
+                return p;
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        // Linux/macOS：$HOME/Downloads；XDG 有 XDG_DOWNLOAD_DIR 时优先（常见发行版默认未设，忽略错误）
+        if let Some(home) = std::env::var_os("HOME") {
             let p = std::path::PathBuf::from(home).join("Downloads");
             if p.is_dir() {
                 return p;

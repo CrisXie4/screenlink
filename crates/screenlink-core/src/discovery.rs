@@ -79,6 +79,12 @@ impl Discovery {
                             if r.ip.is_empty() {
                                 r.ip = src.ip().to_string();
                             }
+                            // 应答来源在虚拟/保留段的一律丢弃（防 TUN/代理伪造源）
+                            if let Ok(src_ip) = src.ip().to_string().parse::<Ipv4Addr>() {
+                                if crate::util::is_virtual_or_reserved_ipv4(src_ip) {
+                                    continue;
+                                }
+                            }
                             if !replies.iter().any(|x: &UdpAgentReply| x.serial == r.serial) {
                                 replies.push(r);
                             }
@@ -94,7 +100,10 @@ impl Discovery {
     /// 同网段 5555 端口并发探测（经典 `adb tcpip 5555` 设备）。
     pub async fn scan_subnet_5555() -> Result<Vec<String>> {
         let mut found = Vec::new();
-        for ip in Self::local_ips() {
+        // 私有网段优先（多网卡时虚拟网卡虽已被 local_ips 过滤，这里再保一层顺序）
+        let mut ips = Self::local_ips();
+        ips.sort_by_key(|ip| !ip.is_private());
+        for ip in ips {
             let net = u32::from(ip) & 0xFFFF_FF00;
             let base = Ipv4Addr::from(net);
             let octets = base.octets();
@@ -134,7 +143,8 @@ impl Discovery {
                 if_addrs::IfAddr::V4(v4) => Some(v4.ip),
                 _ => None,
             })
-            .filter(|ip| !ip.is_loopback())
+            // 排除回环与虚拟网卡/保留段（Clash fake-ip TUN、链路本地、CGNAT 等）
+            .filter(|ip| !crate::util::is_virtual_or_reserved_ipv4(*ip))
             .collect()
     }
 }

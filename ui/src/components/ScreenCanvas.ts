@@ -1,6 +1,7 @@
 // 中间画布区：空状态（引导卡片）/ 连接中（loading + 步骤）/ 投屏画布 + 悬浮工具条
-import { el, selectedDevice, store } from "../store";
+import { el, selectedDevice, store, toast } from "../store";
 import { iconEl } from "../icons";
+import { api } from "../tauri";
 import { MirrorSession, type SessionCallbacks } from "../session";
 
 export class ScreenCanvas {
@@ -72,14 +73,36 @@ export class ScreenCanvas {
     // connected：悬浮工具条
     this.canvas.classList.remove("hidden");
     this.canvas.focus();
+    const audioOn = store.settings.audio;
     const toolbar = el("div", { class: "canvas-toolbar" },
       tbBtn("back", "返回", () => this.session.sendKey("back")),
       tbBtn("home", "Home", () => this.session.sendKey("home")),
       tbBtn("recents", "后台", () => this.session.sendKey("recents")),
       tbBtn("camera", "截图", () => void this.session.screenshot()),
       tbBtn("maximize", "全屏", () => this.session.toggleFullscreen(this.area)),
+      el("button", {
+        class: audioOn ? "small primary" : "small",
+        title: audioOn ? "音频转发已开（点击关闭，下次连接生效）" : "音频转发已关（点击开启，下次连接生效）",
+        onclick: () => void this.toggleAudioSetting(),
+      }, iconEl(audioOn ? "volume" : "volumeX", 13), document.createTextNode(audioOn ? "声音开" : "声音关")),
     );
     this.area.append(toolbar);
+  }
+
+  /** 工具栏音频转发快捷开关：写回设置，下次连接生效（音频在会话启动时协商） */
+  private async toggleAudioSetting() {
+    const next = { ...store.settings, audio: !store.settings.audio };
+    try {
+      await api.setSettings(next);
+      store.settings = next;
+      this.render();
+      toast(
+        next.audio ? "音频转发已开启" : "音频转发已关闭",
+        "下次连接投屏时生效",
+      );
+    } catch (e) {
+      toast("保存设置失败", String(e), true);
+    }
   }
 
   /** MCP 截图请求：上报当前帧 */

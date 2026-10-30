@@ -41,6 +41,11 @@ export class MirrorSession {
   private serial: string | null = null;
   private info = { width: 1080, height: 2400 };
   private decoder: VideoDecoder | null = null;
+  // ---- 音频转发（opus，Rust 侧 kind=3 帧） ----
+  private audioDecoder: AudioDecoder | null = null;
+  private audioCtx: AudioContext | null = null;
+  private audioNextTime = 0; // 下一个包的调度播放时刻（抗抖动粒度调度）
+  private audioTs = 0; // EncodedAudioChunk 时间戳（仅保序，opus 无真实 pts）
   private ws: WebSocket | null = null;
   private intentionalClose = false;
   private frameCount = 0;
@@ -83,6 +88,9 @@ export class MirrorSession {
     try {
       const res = await api.startMirror(serial);
       store.wsPort = res.wsPort;
+      if (store.settings.audio && res.audioEnabled === false) {
+        toast("此设备不支持音频转发", "音频转发需 Android 11+，已按无音频连接", true);
+      }
     } catch (e) {
       this.serial = null;
       this.cb.onClosed(String(e));
@@ -108,6 +116,7 @@ export class MirrorSession {
       }
       this.decoder = null;
     }
+    this.teardownAudio();
     this.detach?.();
     this.detach = null;
     this.unlistenDrag?.();
@@ -131,6 +140,15 @@ export class MirrorSession {
             if (j.info.descriptionB64 && j.info.codec) {
               this.configureFromDescription(j.info.codec, j.info.descriptionB64);
             }
+            if (j.info.audio) {
+              this.setupAudio(j.info.audio);
+            }
+          } else if (j.audioInfo) {
+            // 音频 config 包（OpusHead）晚于 info 到达时的补发
+            this.setupAudio(j.audioInfo);
+          }
+          if (j.audioDisabled) {
+            toast("设备音频不可用", "音频采集失败或被系统限制，已按仅视频投屏", true);
           }
         } catch {
           /* ignore */
@@ -166,6 +184,14 @@ export class MirrorSession {
   private onChunk(buf: Uint8Array) {
     if (buf.length < 9) return;
     const kind = buf[0];
+    if (kind === 3) {
+      // 音频帧：[3][pts µs][opus 包]，pts 由 Rust 泵从 scrcpy 帧头剥离标志位后透传
+      const pts = Number(
+        new DataView(buf.buffer, buf.byteOffset, buf.byteLength).getBigInt64(1, false),
+      );
+      this.onAudioPacket(pts, buf.subarray(9));
+      return;
+    }
     const pts = Number(
       new DataView(buf.buffer, buf.byteOffset, buf.byteLength).getBigInt64(1, false),
     );
@@ -181,6 +207,112 @@ export class MirrorSession {
     } catch {
       /* 单块失败不中断会话 */
     }
+  }
+
+  // ---- 音频：AudioDecoder 解 opus -> AudioBuffer 粒度调度播放 ----
+  // 老运行时没有 AudioDecoder/WebCodecs 音频时静音降级（视频不受影响）
+  private setupAudio(info: {
+    codec: string;
+    sampleRate: number;
+    channels: number;
+    descriptionB64?: string;
+  }) {
+    if (this.audioDecoder || typeof AudioDecoder === "undefined") return;
+    let description: Uint8Array | undefined;
+    if (info.descriptionB64) {
+      const bin = atob(info.descriptionB64);
+      description = new Uint8Array(bin.length);
+      for (let i = 0; i < bin.length; i++) description[i] = bin.charCodeAt(i);
+    }
+    try {
+      this.audioCtx = new AudioContext({ sampleRate: info.sampleRate });
+      void this.audioCtx.resume();
+    } catch {
+      this.audioCtx = null;
+    }
+    this.audioNextTime = 0;
+    this.audioTs = 0;
+    this.audioDecoder = new AudioDecoder({
+      output: (data) => this.onAudioData(data),
+      error: () => {},
+    });
+    this.audioDecoder.configure({
+      codec: info.codec,
+      sampleRate: info.sampleRate,
+      numberOfChannels: info.channels,
+      ...(description ? { description: description as BufferSource } : {}),
+    });
+  }
+
+  private onAudioPacket(pts: number, payload: Uint8Array) {
+    if (!this.audioDecoder || this.audioDecoder.state !== "configured") return;
+    // 设备 pts（µs）可用则直接用；异常时退化为单调递增计数（保序即可）
+    if (pts > 0) {
+      this.audioTs = Math.max(pts, this.audioTs + 1);
+    } else {
+      this.audioTs += 20000;
+    }
+    try {
+      this.audioDecoder.decode(
+        new EncodedAudioChunk({
+          type: "key",
+          timestamp: this.audioTs,
+          data: payload as BufferSource,
+        }),
+      );
+    } catch {
+      /* 单包失败不中断会话 */
+    }
+  }
+
+  private onAudioData(data: AudioData) {
+    const ctx = this.audioCtx;
+    if (!ctx) {
+      data.close();
+      return;
+    }
+    try {
+      const frames = data.numberOfFrames;
+      const buffer = ctx.createBuffer(data.numberOfChannels, frames, data.sampleRate);
+      for (let c = 0; c < data.numberOfChannels; c++) {
+        const plane = new Float32Array(frames);
+        data.copyTo(plane, { planeIndex: c, format: "f32-planar" });
+        buffer.copyToChannel(plane, c);
+      }
+      const dur = frames / data.sampleRate;
+      const MIN_BUFFER = 0.06; // 起步缓冲，抗网络/解码抖动
+      if (this.audioNextTime < ctx.currentTime + 0.01) {
+        this.audioNextTime = ctx.currentTime + MIN_BUFFER;
+      } else if (this.audioNextTime > ctx.currentTime + 0.5) {
+        // 积压过多：丢弃积压，从最新包继续
+        this.audioNextTime = ctx.currentTime + MIN_BUFFER;
+      }
+      const src = ctx.createBufferSource();
+      src.buffer = buffer;
+      src.connect(ctx.destination);
+      src.start(this.audioNextTime);
+      this.audioNextTime += dur;
+    } catch {
+      /* 单帧失败不中断会话 */
+    } finally {
+      data.close();
+    }
+  }
+
+  private teardownAudio() {
+    if (this.audioDecoder) {
+      try {
+        this.audioDecoder.close();
+      } catch {
+        /* already closed */
+      }
+      this.audioDecoder = null;
+    }
+    if (this.audioCtx) {
+      void this.audioCtx.close().catch(() => {});
+      this.audioCtx = null;
+    }
+    this.audioNextTime = 0;
   }
 
   private onFrame(frame: VideoFrame) {

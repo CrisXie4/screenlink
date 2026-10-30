@@ -25,6 +25,8 @@ pub const SCRCPY_VERSION: &str = "2.7";
 pub const CODEC_H264: u32 = 0x6832_3634;
 pub const CODEC_H265: u32 = 0x6832_3635;
 pub const CODEC_AV1: u32 = 0x6176_3031;
+/// audio socket codec meta（send_codec_meta=true 时 4B 头）
+pub const CODEC_OPUS: u32 = 0x6F70_7573; // "opus"
 
 pub const PACKET_FLAG_CONFIG: u64 = 1 << 63;
 pub const PACKET_FLAG_KEY_FRAME: u64 = 1 << 62;

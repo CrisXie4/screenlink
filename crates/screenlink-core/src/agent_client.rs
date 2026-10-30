@@ -23,6 +23,16 @@ pub const T_NEED_PAIR: u8 = 0x04;
 pub const T_PAIR: u8 = 0x05;
 pub const T_PAIR_OK: u8 = 0x06;
 pub const T_PAIR_FAIL: u8 = 0x07;
+/// 数据面（PROTOCOL §4 帧类型总表，agent_link 使用）
+pub const T_LIST_REQ: u8 = 0x10;
+pub const T_LIST_RSP: u8 = 0x11;
+pub const T_RECV_REQ: u8 = 0x12;
+pub const T_SEND_REQ: u8 = 0x20;
+pub const T_SEND_ACK: u8 = 0x21;
+pub const T_DATA: u8 = 0x22;
+pub const T_PROGRESS: u8 = 0x23;
+pub const T_TRANSFER_DONE: u8 = 0x24;
+pub const T_CANCEL: u8 = 0x25;
 pub const T_PING: u8 = 0x30;
 pub const T_PONG: u8 = 0x31;
 pub const T_ERR: u8 = 0x40;
@@ -39,6 +49,10 @@ pub struct PairedPhone {
     pub name: String,
     pub ip: String,
     pub paired_at: u64,
+    /// 手机持久实例 id（ANDROID_ID / mDNS TXT id，§8.2 防 token 收割绑定）。
+    /// 旧记录为 None：首次 agent 通道发送成功后回填。
+    #[serde(default)]
+    pub instance_id: Option<String>,
 }
 
 fn store_path() -> std::path::PathBuf {
@@ -76,7 +90,11 @@ pub struct PairingSession {
     pub ip: String,
 }
 
-async fn write_frame(w: &mut (impl AsyncWriteExt + Unpin), t: u8, payload: &[u8]) -> Result<()> {
+pub(crate) async fn write_frame(
+    w: &mut (impl AsyncWriteExt + Unpin),
+    t: u8,
+    payload: &[u8],
+) -> Result<()> {
     let mut head = Vec::with_capacity(12 + payload.len());
     head.extend_from_slice(MAGIC);
     head.push(1);
@@ -89,7 +107,7 @@ async fn write_frame(w: &mut (impl AsyncWriteExt + Unpin), t: u8, payload: &[u8]
     Ok(())
 }
 
-async fn read_frame(r: &mut (impl AsyncReadExt + Unpin)) -> Result<(u8, Vec<u8>)> {
+pub(crate) async fn read_frame(r: &mut (impl AsyncReadExt + Unpin)) -> Result<(u8, Vec<u8>)> {
     let mut head = [0u8; 12];
     r.read_exact(&mut head).await?;
     if &head[0..4] != MAGIC {
@@ -219,6 +237,7 @@ impl PairingSession {
                             .duration_since(std::time::UNIX_EPOCH)
                             .map(|d| d.as_secs())
                             .unwrap_or(0),
+                        instance_id: None,
                     };
                     if phone.token.len() != 43 || phone.token_id.len() != 8 {
                         return Err(anyhow!("手机返回的 token 格式异常"));
@@ -304,6 +323,11 @@ fn sha256_hex(data: &[u8]) -> String {
         let _ = write!(s, "{b:02x}");
     }
     s
+}
+
+/// token → token_id（sha256 前 8 hex，§3.3）；agent_link 握手用。
+pub fn token_id_of(token: &str) -> String {
+    sha256_hex(token.as_bytes())[..8].to_string()
 }
 
 /// 最小 SHA-256 实现（无外部依赖；输入为 32B token，性能无要求）。

@@ -52,10 +52,11 @@ export class TransferQueue {
     const speed = j.state === "running" && j.speed_bps > 0 ? ` ${fmtSpeed(j.speed_bps)}` : "";
     const eta = j.state === "running" && j.eta_secs > 1 ? ` 剩 ${Math.ceil(j.eta_secs)}s` : "";
     const size = j.total_bytes > 0 ? ` · ${fmtBytes(j.copied_bytes)}/${fmtBytes(j.total_bytes)}` : "";
+    const channel = j.channel === "agent" ? "高速通道" : "adb";
     return el("div", { class: `job ${j.state}` },
       el("div", { class: "row" },
         el("span", { class: "title" }, j.title),
-        el("span", { class: "stat" }, `${stateText[j.state]}${speed}${eta}${size}`),
+        el("span", { class: "stat" }, `${stateText[j.state]} · ${channel}${speed}${eta}${size}`),
         j.state === "running" || j.state === "queued"
           ? el("button", {
             class: "ghost small",

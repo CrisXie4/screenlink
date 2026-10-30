@@ -46,6 +46,7 @@ export function openSettingsDialog(onChanged: () => void) {
   const pushDir = el("input", { type: "text", value: s.push_dir }) as HTMLInputElement;
   const pullDir = el("input", { type: "text", value: s.pull_dir, placeholder: "默认下载目录" }) as HTMLInputElement;
   const clipSwitch = switchInput(s.clipboard_sync);
+  const audioSwitch = switchInput(s.audio);
   const autoSwitch = switchInput(s.auto_switch_wifi);
 
   const saveBtn = el("button", {
@@ -60,6 +61,7 @@ export function openSettingsDialog(onChanged: () => void) {
         push_dir: pushDir.value.trim() || "/sdcard/Download/ScreenLink",
         pull_dir: pullDir.value.trim(),
         clipboard_sync: clipSwitch.checked,
+        audio: audioSwitch.checked,
         auto_switch_wifi: autoSwitch.checked,
       };
       try {
@@ -93,6 +95,7 @@ export function openSettingsDialog(onChanged: () => void) {
       field("推送目录（手机）", pushDir),
       field("接收目录（电脑）", pullDir),
       field("剪贴板双向同步", clipSwitch, "电脑与手机复制粘贴自动同步"),
+      field("音频转发到电脑", audioSwitch, "开启后手机媒体声音会在电脑播放（手机同时出声）；关闭则仅手机出声。需 Android 11+，下次投屏生效"),
       field("拔线自动切 WiFi", autoSwitch, "USB 断开后自动尝试无线重连"),
       el("div", { style: "text-align:right;margin-top:8px" }, saveBtn),
     ),

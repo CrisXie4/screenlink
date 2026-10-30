@@ -27,7 +27,11 @@ impl ClipboardSync {
             let stop = stop_rx;
             let mut clip = match Clipboard::new() {
                 Ok(c) => c,
-                Err(_) => return,
+                Err(e) => {
+                    // Wayland/X11 会话异常、macOS 沙盒等场景：剪贴板同步不可用，明示原因
+                    tracing::warn!("本机剪贴板不可用，剪贴板双向同步已停用：{e}");
+                    return;
+                }
             };
             let mut last_text = String::new();
             loop {

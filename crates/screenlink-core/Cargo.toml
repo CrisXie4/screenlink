@@ -16,9 +16,10 @@ uuid = { workspace = true }
 base64 = { workspace = true }
 tokio-tungstenite = "0.24"
 futures-util = "0.3"
-arboard = "3"
+arboard = { version = "3", features = ["wayland-data-control"] }
 if-addrs = "0.13"
 roxmltree = "0.20"
+md-5 = "0.10"
 
 [[bin]]
 name = "screenlink-cli"

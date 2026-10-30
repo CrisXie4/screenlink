@@ -1,5 +1,6 @@
 pub mod adb;
 pub mod agent_client;
+pub mod agent_link;
 pub mod audit;
 pub mod auth;
 pub mod clipboard;

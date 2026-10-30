@@ -58,6 +58,8 @@ pub struct JobSnapshot {
     pub percent: u8,
     pub speed_bps: f64,
     pub eta_secs: f64,
+    /// 传输通道："adb"（adb push/pull）或 "agent"（伴侣 App TCP 直连）
+    pub channel: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
     pub file_count: usize,
@@ -85,6 +87,8 @@ struct PendingJob {
     remote: String,
     local_dir: PathBuf,
     policy: ConflictPolicy,
+    /// 伴侣 App agent 直连目标（Some = 可尝试 TCP 高速通道，失败回退 adb）
+    agent: Option<crate::agent_link::AgentTarget>,
 }
 
 impl TransferManager {
@@ -111,7 +115,7 @@ impl TransferManager {
         self.snapshots_tx.subscribe()
     }
 
-    /// 入队传输任务（同一设备内 adb 串行执行，不同设备并行）。
+    /// 入队传输任务（同一设备内串行执行，不同设备并行）。
     #[allow(clippy::too_many_arguments)]
     pub fn enqueue(
         &self,
@@ -122,6 +126,7 @@ impl TransferManager {
         remote: &str,
         local_dir: PathBuf,
         policy: ConflictPolicy,
+        agent: Option<crate::agent_link::AgentTarget>,
     ) -> u64 {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let total: u64 = files
@@ -145,6 +150,7 @@ impl TransferManager {
                 percent: 0,
                 speed_bps: 0.0,
                 eta_secs: 0.0,
+                channel: if agent.is_some() { "agent" } else { "adb" },
                 error: None,
                 file_count: files.len(),
             };
@@ -158,6 +164,7 @@ impl TransferManager {
             remote: remote.to_string(),
             local_dir,
             policy,
+            agent,
         };
         if let Ok(mut map) = self.jobs.lock() {
             map.insert(id, job.clone());
@@ -178,6 +185,7 @@ impl TransferManager {
                 &job.remote,
                 job.local_dir.clone(),
                 job.policy,
+                job.agent.clone(),
             ),
             JobKind::Pull => self.enqueue(
                 JobKind::Pull,
@@ -187,6 +195,7 @@ impl TransferManager {
                 &job.remote,
                 job.local_dir.clone(),
                 job.policy,
+                job.agent.clone(),
             ),
         })
     }
@@ -217,6 +226,7 @@ impl TransferManager {
                 copied_bytes: 0,
                 percent: 0,
                 speed_bps: 0.0,
+                channel: "adb",
                 eta_secs: 0.0,
                 error: None,
                 file_count: 0,
@@ -313,7 +323,7 @@ async fn run_job(
     }
 }
 
-/// push 主流程：逐文件原子传输 + 冲突策略 + 失败重试 1 次。
+/// push 主流程：agent TCP 通道（可选）→ 逐文件原子传输 + 冲突策略 + 失败重试 1 次。
 async fn run_push(
     adb: &Adb,
     job: &PendingJob,
@@ -321,6 +331,26 @@ async fn run_push(
     id: u64,
     update: Arc<dyn Fn(u64, &mut dyn FnMut(&mut JobSnapshot)) + Send + Sync>,
 ) -> anyhow::Result<()> {
+    // agent TCP 高速通道：仅平铺文件（协议 §5.3 名字禁路径分隔符）。
+    // 任何一步失败整体回退 adb，不丢任务。冲突策略在 agent 路径下由手机端
+    // SAF 语义决定（同名自动改名），Overwrite/Rename 不再精细区分。
+    if let Some(target) = &job.agent {
+        let all_flat = job.rel_paths.iter().all(|r| !r.contains('/'));
+        if all_flat {
+            match push_via_agent(target, job, &cancel, id, update.clone()).await {
+                Ok(()) => return Ok(()),
+                Err(e) => {
+                    if cancel.is_cancelled() {
+                        anyhow::bail!("已取消");
+                    }
+                    tracing::warn!("agent 通道失败，回退 adb：{e:#}");
+                    update(id, &mut |s| s.channel = "adb");
+                }
+            }
+        } else {
+            update(id, &mut |s| s.channel = "adb");
+        }
+    }
     let dir = job.remote.trim_end_matches('/').to_string();
     let total: u64 = job
         .files
@@ -430,6 +460,62 @@ async fn run_push(
         emit_progress(&update, id, done_bytes, total, &start, &last_emit, true);
     }
     Ok(())
+}
+
+/// agent TCP 直连推送：一条连接传完整个任务（协议 §1 单连接多路复用，
+/// §5.3 同一连接并发 ≤8；这里逐文件串行，进度与取消语义与 adb 路径一致）。
+async fn push_via_agent(
+    target: &crate::agent_link::AgentTarget,
+    job: &PendingJob,
+    cancel: &CancelToken,
+    id: u64,
+    update: Arc<dyn Fn(u64, &mut dyn FnMut(&mut JobSnapshot)) + Send + Sync>,
+) -> anyhow::Result<()> {
+    let mut link = crate::agent_link::AgentLink::connect(target).await?;
+    let total: u64 = job
+        .files
+        .iter()
+        .filter_map(|f| std::fs::metadata(f).ok())
+        .map(|m| m.len())
+        .sum();
+    let start = std::time::Instant::now();
+    let last_emit = Arc::new(AtomicU64::new(0));
+    let n = job.files.len();
+    let mut done_bytes: u64 = 0;
+    let res = async {
+        for (idx, f) in job.files.iter().enumerate() {
+            if cancel.is_cancelled() {
+                anyhow::bail!("已取消");
+            }
+            let fname = f
+                .file_name()
+                .map(|s| s.to_string_lossy().into_owned())
+                .unwrap_or_else(|| format!("file-{idx}"));
+            let rel = job
+                .rel_paths
+                .get(idx)
+                .cloned()
+                .unwrap_or_else(|| fname.clone());
+            update(id, &mut |s| {
+                s.title = format!("发送 {}/{}：{}", idx + 1, n, rel);
+            });
+            let size = std::fs::metadata(f).map(|m| m.len()).unwrap_or(0);
+            let base = done_bytes;
+            let start_t = start;
+            let le = last_emit.clone();
+            let upd = update.clone();
+            link.send_file(f, &rel, cancel, move |copied, _total| {
+                emit_progress(&upd, id, base + copied, total, &start_t, &le, false);
+            })
+            .await?;
+            done_bytes += size;
+            emit_progress(&update, id, done_bytes, total, &start, &last_emit, true);
+        }
+        Ok(())
+    }
+    .await;
+    drop(link); // 触发 BYE
+    res
 }
 
 /// 单文件一次尝试：清残留 .part -> push 到临时名 -> 原子 mv 到最终名。

@@ -26,6 +26,8 @@ pub struct Settings {
     pub pull_dir: String,
     /// 剪贴板双向同步
     pub clipboard_sync: bool,
+    /// 投屏音频转发（opus；设备需 Android 11+，低版本自动降级为无音频）
+    pub audio: bool,
     /// 拔线后自动尝试 WiFi 重连
     pub auto_switch_wifi: bool,
     /// serial -> 已知 WiFi 地址（自动重连用）
@@ -42,6 +44,8 @@ impl Default for Settings {
             push_dir: "/sdcard/Download/ScreenLink".into(),
             pull_dir: String::new(),
             clipboard_sync: true,
+            // 音频转发默认关：手机媒体声音不一定要在电脑播放，设置/工具栏可开
+            audio: false,
             auto_switch_wifi: true,
             wifi_targets: HashMap::new(),
         }
@@ -138,7 +142,7 @@ impl AppState {
     pub async fn start_mirror(
         self: &std::sync::Arc<Self>,
         serial: &str,
-    ) -> anyhow::Result<screenlink_core::scrcpy::VideoInfo> {
+    ) -> anyhow::Result<(screenlink_core::scrcpy::VideoInfo, bool)> {
         {
             let sessions = self.sessions.lock().unwrap();
             if let Some(s) = sessions.get(serial) {
@@ -149,13 +153,26 @@ impl AppState {
         }
         let jar = screenlink_core::scrcpy::session::locate_server_jar()?;
         let st = self.settings();
+        // 音频需 Android 11（SDK 30）+；低版本强开会导致 server 启动失败，自动降级
+        let mut audio = st.audio;
+        if audio {
+            let sdk = self
+                .adb
+                .shell(serial, "getprop ro.build.version.sdk")
+                .await
+                .ok()
+                .and_then(|s| s.trim().parse::<i32>().ok());
+            if sdk.is_some_and(|s| s < 30) {
+                audio = false;
+            }
+        }
         let opts = screenlink_core::scrcpy::ServerOptions {
             scid: std::process::id() as u32 & 0x7fff_ffff,
             max_size: st.max_size,
             bit_rate: st.bit_rate,
             max_fps: st.max_fps,
             keyframe_interval: st.keyframe_interval.max(1),
-            audio: false,
+            audio,
             stay_awake: true,
             show_touches: false,
         };
@@ -205,11 +222,12 @@ impl AppState {
             }
         });
 
+        let audio_enabled = handle.audio_enabled;
         self.sessions
             .lock()
             .unwrap()
             .insert(serial.to_string(), handle);
-        Ok(info)
+        Ok((info, audio_enabled))
     }
 
     pub fn stop_mirror(&self, serial: &str) {

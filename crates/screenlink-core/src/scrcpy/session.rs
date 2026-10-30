@@ -96,8 +96,14 @@ pub enum SessionStateInner {
 }
 
 /// 上发给渲染端（WS）的视频块：`[u8 kind][i64 pts_be][payload]`
-/// kind: 0=CONFIG(SPS/PPS) 1=KEY 2=DELTA
+/// kind: 0=CONFIG(SPS/PPS) 1=KEY 2=DELTA 3=AUDIO(opus)
 pub const CHUNK_HEADER_LEN: usize = 9;
+
+/// opus 音频流配置（OpusHead config 包，经 WS info 下发作 AudioDecoder description）
+#[derive(Debug, Clone)]
+pub struct AudioCfg {
+    pub description_b64: String,
+}
 
 #[derive(Debug, Clone)]
 pub enum DeviceEvent {
@@ -108,6 +114,14 @@ pub struct SessionHandle {
     pub serial: String,
     pub info: VideoInfo,
     pub video_rx: broadcast::Receiver<Vec<u8>>,
+    /// 音频块接收端（kind=3 帧，格式见 CHUNK_HEADER_LEN；audio=false 时为 None）
+    pub audio_rx: Option<broadcast::Receiver<Vec<u8>>>,
+    /// 音频是否启用（决定 WS info 是否携带 audio 元数据）
+    pub audio_enabled: bool,
+    /// opus OpusHead config 包（server 发出的首个 CONFIG 帧，作 AudioDecoder description）
+    pub audio_cfg: Arc<std::sync::Mutex<Option<AudioCfg>>>,
+    /// 设备音频采集失败（server 发了 disable 标记或流中断且从未产出数据帧）
+    pub audio_disabled: Arc<std::sync::atomic::AtomicBool>,
     /// SPS/PPS config 包缓存（流启动时只发一次，后接入的渲染端需要补发）
     pub config_cache: Arc<std::sync::Mutex<Option<Vec<u8>>>>,
     /// avcC 描述 + codec 串（Rust 端从 config 包解析，经 WS info 下发）
@@ -195,7 +209,11 @@ pub fn locate_server_jar() -> Result<std::path::PathBuf> {
     ))
 }
 
-/// 启动投屏会话（video + control；audio 协议已支持，默认关闭以保最低延迟）。
+/// 启动投屏会话（video + control；opts.audio=true 时加 audio 通道，opus 48kHz）。
+///
+/// audio=true 时 socket 连接顺序必须为 video -> audio -> control（server 按此顺序
+/// accept）；audio 帧格式与视频共用 Streamer.writeFrameMeta（12B 头），首个 CONFIG
+/// 帧为 OpusHead。设备采集失败时 server 发 4B 全零标记并继续仅视频。
 pub async fn start_session(
     adb: &Adb,
     serial: &str,
@@ -334,13 +352,26 @@ pub async fn start_session(
     let mut video_rd = connect_with_retry(local_port, true)
         .await
         .map_err(|e| anyhow!("连接 video socket 失败: {e}"))?;
-    dbg("video connected + dummy ok, connecting control socket");
+    dbg("video connected + dummy ok");
+    // audio socket：scrcpy server 按 video -> audio -> control 顺序 accept，
+    // 开启音频时必须在 control 之前连接，否则 control 会错位到 audio 监听。
+    let audio_enabled = opts.audio;
+    let mut audio_rd = if audio_enabled {
+        Some(
+            connect_with_retry(local_port, false)
+                .await
+                .map_err(|e| anyhow!("连接 audio socket 失败: {e}"))?,
+        )
+    } else {
+        None
+    };
+    dbg("connecting control socket");
     let mut control = connect_with_retry(local_port, false)
         .await
         .map_err(|e| anyhow!("连接 control socket 失败: {e}"))?;
     dbg("control connected");
     // 注意：scrcpy 的 send_dummy_byte 只在第一个 accept 的 socket（video）上发一次，
-    // control socket 不写 dummy —— 不能在这里读，否则双方死锁。
+    // audio/control socket 不写 dummy —— 不能在这里读，否则双方死锁。
 
     dbg("reading device meta");
     // 5. video socket：64B 设备名 + 12B 编解码头
@@ -361,7 +392,24 @@ pub async fn start_session(
     let width = i32::from_be_bytes([meta[4], meta[5], meta[6], meta[7]]);
     let height = i32::from_be_bytes([meta[8], meta[9], meta[10], meta[11]]);
 
+    // audio socket 握手：send_codec_meta=true 时开头 4B codec id（"opus"），
+    // 其后帧格式与视频一致（[u64 pts|flags][u32 len]，见下方音频泵注释）
+    if let Some(rd) = audio_rd.as_mut() {
+        let codec_meta = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            crate::util::read_exact(rd, 4),
+        )
+        .await
+        .map_err(|_| anyhow!("读取 audio codec meta 超时"))??;
+        let codec_id = crate::util::parse_u32_be(&codec_meta);
+        if codec_id != protocol::CODEC_OPUS {
+            anyhow::bail!("设备音频编解码非 opus（{codec_id:#010x}），请关闭音频转发");
+        }
+        dbg("audio codec meta ok (opus)");
+    }
+
     let (video_tx, video_rx) = broadcast::channel::<Vec<u8>>(128);
+    let (audio_tx, audio_rx) = broadcast::channel::<Vec<u8>>(256);
     let (events_tx, events_rx) = broadcast::channel::<DeviceEvent>(32);
     let (state_tx, state_rx) = watch::channel(SessionStateInner::Mirroring);
     let (stop_tx, stop_rx) = watch::channel(false);
@@ -426,6 +474,59 @@ pub async fn start_session(
                 break; // 无订阅者（UI 已关闭）
             }
         }
+    });
+
+    // 6.5 音频泵：帧头与视频完全一致（[u64 pts|flags][u32 len]，Streamer.writeFrameMeta
+    // 音视频共用，12 字节——不是 4 字节长度前缀）。首帧为 CONFIG（OpusHead，
+    // scrcpy fixOpusConfigPacket 已裁好），缓存后经 WS info 下发作 AudioDecoder
+    // description，不进数据流。设备采集失败时 server 写 4B 全零 disable 标记。
+    let audio_cfg: Arc<std::sync::Mutex<Option<AudioCfg>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let audio_cfg2 = audio_cfg.clone();
+    let audio_disabled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let audio_disabled2 = audio_disabled.clone();
+    let audio_pump: Option<JoinHandle<()>> = audio_rd.map(|mut rd| {
+        tokio::spawn(async move {
+            let audio_cfg = audio_cfg2;
+            let audio_disabled = audio_disabled2;
+            let mut got_data = false;
+            loop {
+                let hdr = match crate::util::read_exact(&mut rd, 12).await {
+                    Ok(h) => h,
+                    Err(_) => break,
+                };
+                let pts_and_flags = crate::util::parse_i64_be(&hdr[0..8]) as u64;
+                let len = crate::util::parse_u32_be(&hdr[8..12]) as usize;
+                // disable 标记 / 异常长度：opus 包正常 <1KB，上限 4MiB 防御
+                if len == 0 || len > (1 << 22) {
+                    break;
+                }
+                let payload = match crate::util::read_exact(&mut rd, len).await {
+                    Ok(p) => p,
+                    Err(_) => break,
+                };
+                if pts_and_flags & protocol::PACKET_FLAG_CONFIG != 0 {
+                    use base64::Engine as _;
+                    let b64 = base64::engine::general_purpose::STANDARD.encode(&payload);
+                    *audio_cfg.lock().unwrap() = Some(AudioCfg { description_b64: b64 });
+                    continue;
+                }
+                got_data = true;
+                let pts = (pts_and_flags
+                    & !(protocol::PACKET_FLAG_CONFIG | protocol::PACKET_FLAG_KEY_FRAME))
+                    as i64;
+                let mut chunk = Vec::with_capacity(CHUNK_HEADER_LEN + payload.len());
+                chunk.push(3u8);
+                chunk.extend_from_slice(&pts.to_be_bytes());
+                chunk.extend_from_slice(&payload);
+                if audio_tx.send(chunk).is_err() {
+                    break; // 无订阅者（UI 已关闭）
+                }
+            }
+            if !got_data {
+                audio_disabled.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+        })
     });
 
     // 7. 控制泵：解析设备消息（剪贴板等）
@@ -509,10 +610,17 @@ pub async fn start_session(
 
     drop(state_tx); // 保留 receiver 侧即可感知结束
 
+    // 泵任务 JoinHandle 丢弃即后台运行（与 video_pump 同模式），仅抑制未使用告警
+    let _ = (video_pump, audio_pump, ctl_pump, supervisor);
+
     Ok(SessionHandle {
         serial: serial_owned,
         info: VideoInfo { codec, width, height },
         video_rx,
+        audio_rx: if audio_enabled { Some(audio_rx) } else { None },
+        audio_enabled,
+        audio_cfg,
+        audio_disabled,
         config_cache,
         avcc_info,
         last_key,
@@ -523,7 +631,3 @@ pub async fn start_session(
         local_port,
     })
 }
-
-// 抑制未使用告警（供未来 audio 通道使用）
-#[allow(dead_code)]
-fn _unused(_: &protocol::ServerOptions) {}

@@ -76,24 +76,110 @@ async fn handle(stream: TcpStream, sessions: SessionMap) -> Result<()> {
     async fn send_info(ws: &mut WsStream, session: &SessionHandle) -> bool {
         let avcc = session.avcc_info.lock().unwrap().clone();
         let Some(avcc) = avcc else { return false };
-        let msg = serde_json::json!({
-            "info": {
-                "width": session.info.width,
-                "height": session.info.height,
-                "codec": avcc.codec,
-                "descriptionB64": avcc.description_b64,
-            }
+        let mut info = serde_json::json!({
+            "width": session.info.width,
+            "height": session.info.height,
+            "codec": avcc.codec,
+            "descriptionB64": avcc.description_b64,
         });
+        // 音频元数据在 OpusHead config 包就绪后才下发（作 AudioDecoder description）
+        if let Some(a) = audio_info(session) {
+            info["audio"] = a;
+        }
+        let msg = serde_json::json!({ "info": info });
         ws.send(tokio_tungstenite::tungstenite::Message::text(msg.to_string()))
             .await
             .is_ok()
     }
+
+    fn audio_info(session: &SessionHandle) -> Option<serde_json::Value> {
+        let cfg = session.audio_cfg.lock().unwrap().clone();
+        cfg.map(|c| {
+            serde_json::json!({
+                "codec": "opus",
+                "sampleRate": 48000,
+                "channels": 2,
+                "descriptionB64": c.description_b64,
+            })
+        })
+    }
+
+    /// 音频 config 包晚于 info 到达时，向已接入客户端补发一条 audioInfo
+    async fn ensure_audio_info(
+        ws: &mut WsStream,
+        session: &SessionHandle,
+        sent: &mut bool,
+    ) -> bool {
+        if *sent {
+            return true;
+        }
+        let Some(a) = audio_info(session) else {
+            return false;
+        };
+        *sent = true;
+        ws.send(tokio_tungstenite::tungstenite::Message::text(
+            serde_json::json!({ "audioInfo": a }).to_string(),
+        ))
+        .await
+        .is_ok()
+    }
+
+    /// 通知客户端设备音频不可用（采集失败/被系统限制，视频不受影响）
+    async fn send_audio_disabled(ws: &mut WsStream) {
+        let _ = ws
+            .send(tokio_tungstenite::tungstenite::Message::text(
+                serde_json::json!({ "audioDisabled": true }).to_string(),
+            ))
+            .await;
+    }
     let mut video_rx = session.video_rx.resubscribe();
+    // 音频流（None = 会话未开音频；Some 且泵结束后置 None 停止轮询）
+    let mut audio_rx = session.audio_rx.as_ref().map(|rx| rx.resubscribe());
+    let mut audio_info_sent = false;
+    // 接入时音频采集已失败（泵早于本次连接结束）的补报
+    if session.audio_enabled
+        && session
+            .audio_disabled
+            .load(std::sync::atomic::Ordering::Relaxed)
+    {
+        send_audio_disabled(&mut ws).await;
+    }
     // 关键帧门控：接入后丢弃 delta 直到首个 key 帧，否则 decoder 报 "A key frame is required"。
     //（SPS/PPS 已在 Rust 端转为 avcC description，经 info JSON 下发，不再进媒体流）
     let mut got_key = false;
     loop {
         tokio::select! {
+            chunk = async {
+                match audio_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                match chunk {
+                    Ok(data) => {
+                        // 音频帧（kind=3）自包含，无需关键帧门控；先于视频 key 到达也要转发。
+                        // config 包（OpusHead description）晚到时先补发 audioInfo
+                        if !ensure_audio_info(&mut ws, &session, &mut audio_info_sent).await {
+                            continue; // description 未就绪，丢弃直至就绪
+                        }
+                        if ws.send(tokio_tungstenite::tungstenite::Message::binary(data)).await.is_err() {
+                            tracing::info!("[ws] 客户端断开（音频发送失败）");
+                            break;
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(_) => {
+                        // 音频泵已结束（设备侧断开），停掉本分支，视频继续
+                        audio_rx = None;
+                        if session
+                            .audio_disabled
+                            .load(std::sync::atomic::Ordering::Relaxed)
+                        {
+                            send_audio_disabled(&mut ws).await;
+                        }
+                    }
+                }
+            }
             chunk = video_rx.recv() => {
                 match chunk {
                     Ok(data) => {

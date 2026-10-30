@@ -25,6 +25,7 @@ export const store: Store = {
     push_dir: "/sdcard/Download/ScreenLink",
     pull_dir: "",
     clipboard_sync: true,
+    audio: false,
     auto_switch_wifi: true,
   },
   aiEnabled: false,

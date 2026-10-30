@@ -66,6 +66,10 @@ impl DeviceInfo {
 pub fn parse_devices_line(line: &str) -> Option<DeviceInfo> {
     let mut parts = line.split_whitespace();
     let serial = parts.next()?.to_string();
+    // 屏蔽虚拟网卡/保留段的幽灵条目（如 Clash fake-ip 段残留的 198.18.0.x:5555 offline）
+    if crate::util::serial_in_virtual_range(&serial) {
+        return None;
+    }
     let state = match parts.next()? {
         "device" => DeviceState::Online,
         "offline" => DeviceState::Offline,

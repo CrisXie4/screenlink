@@ -105,22 +105,24 @@ async fn run() -> anyhow::Result<()> {
         "mirror" => {
             let s = match serial.clone() { Some(s) => s, None => first_serial(&adb).await };
             let frames: usize = arg_of(&args, "--frames").and_then(|f| f.parse().ok()).unwrap_or(120);
+            let audio_on = args.iter().any(|a| a == "--audio");
             let jar = screenlink_core::scrcpy::session::locate_server_jar()
                 .expect("scrcpy server jar 未找到");
             let t0 = std::time::Instant::now();
             let session = screenlink_core::scrcpy::start_session(
                 &adb,
                 &s,
-                Default::default(),
+                screenlink_core::scrcpy::protocol::ServerOptions { audio: audio_on, ..Default::default() },
                 &jar,
             )
             .await?;
             println!(
-                "session started in {}ms: {}x{} codec={:08x}",
+                "session started in {}ms: {}x{} codec={:08x} audio={}",
                 t0.elapsed().as_millis(),
                 session.info.width,
                 session.info.height,
-                session.info.codec
+                session.info.codec,
+                session.audio_enabled,
             );
             {
                 let info = session.avcc_info.lock().unwrap().clone();
@@ -140,13 +142,36 @@ async fn run() -> anyhow::Result<()> {
                 }
             }
             let mut rx = session.video_rx.resubscribe();
+            let mut audio_rx = session.audio_rx.as_ref().map(|r| r.resubscribe());
             let mut n = 0usize;
             let mut key_dumped = false;
             let mut bytes = 0u64;
+            let mut a_pkts = 0usize;
+            let mut a_bytes = 0u64;
             let first_key = std::time::Instant::now();
             let mut first_key_ms = 0u128;
             while n < frames {
-                match rx.recv().await {
+                tokio::select! {
+                    chunk = async {
+                        match audio_rx.as_mut() {
+                            Some(r) => r.recv().await,
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        match chunk {
+                            Ok(c) => {
+                                if a_pkts == 0 {
+                                    println!("first audio chunk: kind={} len={} payload_head={}",
+                                        c[0], c.len(), c.iter().skip(9).take(8).map(|b| format!("{b:02x}")).collect::<String>());
+                                }
+                                a_pkts += 1;
+                                a_bytes += (c.len() - 9) as u64;
+                            }
+                            Err(e) => { eprintln!("audio recv err: {e}"); break; }
+                        }
+                    }
+                    chunk = rx.recv() => {
+                        match chunk {
                     Ok(chunk) => {
                         if chunk[0] == 1 && first_key_ms == 0 {
                             first_key_ms = first_key.elapsed().as_millis();
@@ -164,10 +189,12 @@ async fn run() -> anyhow::Result<()> {
                         break;
                     }
                 }
+                    }
+                }
             }
             let el = first_key.elapsed().as_secs_f64();
             println!(
-                "received {n} chunks, {:.2} MB, avg {:.0} KB/chunk, first_key={}ms, {:.1} fps",
+                "received {n} chunks, {:.2} MB, avg {:.0} KB/chunk, first_key={}ms, {:.1} fps; audio packets={a_pkts} bytes={a_bytes}",
                 bytes as f64 / 1e6,
                 bytes as f64 / 1e3 / n.max(1) as f64,
                 first_key_ms,
@@ -254,6 +281,31 @@ async fn run() -> anyhow::Result<()> {
                     i, e.class, e.text, e.bounds, e.cx, e.cy
                 );
             }
+            Ok(())
+        }
+        "agent-send" => {
+            // 用法: agent-send <ip:port> <token> <file> [name]
+            let addr = args.get(1).cloned().expect("ip:port");
+            let token = args.get(2).cloned().expect("token");
+            let file = std::path::PathBuf::from(args.get(3).cloned().expect("file"));
+            let name = args
+                .get(4)
+                .cloned()
+                .unwrap_or_else(|| file.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default());
+            let target = screenlink_core::agent_link::AgentTarget { addr, token };
+            let t0 = std::time::Instant::now();
+            let mut link = screenlink_core::agent_link::AgentLink::connect(&target).await?;
+            println!("agent connected in {:?}", t0.elapsed());
+            let size = std::fs::metadata(&file)?.len();
+            let t1 = std::time::Instant::now();
+            link.send_file(&file, &name, &screenlink_core::adb::CancelToken::new(), |c, total| {
+                print!("\r{}/{} ({:.0}%)", c, total, c as f64 / total.max(1) as f64 * 100.0);
+                use std::io::Write;
+                let _ = std::io::stdout().flush();
+            })
+            .await?;
+            let el = t1.elapsed().as_secs_f64();
+            println!("\nsend done: {} bytes in {:.2}s = {:.1} MB/s", size, el, size as f64 / 1e6 / el);
             Ok(())
         }
         "help" | _ => {

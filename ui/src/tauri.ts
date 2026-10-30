@@ -58,6 +58,8 @@ export interface JobSnapshot {
   percent: number;
   speed_bps: number;
   eta_secs: number;
+  /** 传输通道："adb" | "agent"（伴侣 App TCP 直连） */
+  channel?: "adb" | "agent";
   error?: string | null;
   file_count: number;
 }
@@ -70,6 +72,7 @@ export interface Settings {
   push_dir: string;
   pull_dir: string;
   clipboard_sync: boolean;
+  audio: boolean;
   auto_switch_wifi: boolean;
 }
 
@@ -114,7 +117,7 @@ export const api = {
   phoneConnect: (ip: string) => call<{ name: string; tokenId: string }>("phone_connect", { ip }),
   phoneBeacons: () => call<{ beacons: { key: string; ip: string }[] }>("phone_beacons"),
   startMirror: (serial: string) =>
-    call<{ info: { width: number; height: number }; wsPort: number }>("start_mirror", { serial }),
+    call<{ info: { width: number; height: number }; wsPort: number; audioEnabled: boolean }>("start_mirror", { serial }),
   stopMirror: (serial: string) => call("stop_mirror", { serial }),
   sendTouch: (serial: string, action: number, x: number, y: number, w: number, h: number, actionButton = 1, buttons = 1) =>
     call("send_touch", { serial, action, x, y, w, h, actionButton, buttons }),
